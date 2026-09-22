@@ -1,0 +1,101 @@
+name: Build RAOfflineProxy (spruce)
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: 'Bundle version (no leading v)'
+        default: '1.13.0-alpha1'
+  workflow_call:
+    inputs:
+      app_version:
+        type: string
+        default: '1.13.0-alpha1'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Ensure beta release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="beta-${{ github.ref_name }}"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" \
+              --target "${{ github.ref_name }}" \
+              --title "Beta Build (${{ github.ref_name }})" \
+              --prerelease \
+              --notes "RAOfflineProxy spruce bundle built from ${{ github.ref_name }}" \
+            || true
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Build bundle
+        env:
+          RAOFFLINEPROXY_APP_VERSION: ${{ inputs.app_version }}
+          ZIG_BIN: zig
+        run: bash ./linux/spruce/build_bundle.sh
+
+      # The bundle is stdlib Python plus one native lib per arch. A wheel or an
+      # interpreter creeping back in is what made it 11463 files once.
+      - name: Verify the bundle stays thin
+        run: |
+          set -eu
+          APP=linux/spruce/dist/raofflineproxy-spruce-app/App/RAOfflineProxy
+          fail=0
+
+          for f in common.sh app/raofflineproxy/main.py \
+                   lib/armv7/libraproxy_rchash.so lib/aarch64/libraproxy_rchash.so; do
+            [ -e "$APP/$f" ] || { echo "missing: $f"; fail=1; }
+          done
+
+          file "$APP/lib/armv7/libraproxy_rchash.so"   | grep -q 'ARM'     || { echo "armv7 rchash wrong arch"; fail=1; }
+          file "$APP/lib/aarch64/libraproxy_rchash.so" | grep -q 'aarch64' || { echo "aarch64 rchash wrong arch"; fail=1; }
+
+          for d in runtime pylibs; do
+            [ -d "$APP/$d" ] && { echo "bundle ships $d again"; fail=1; } || true
+          done
+          if find "$APP" -name 'libSDL2*' | grep -q .; then
+            echo "bundle ships SDL2 again"; fail=1
+          fi
+
+          # The runner has no pygame, so a plain import proves the package
+          # does not need one.
+          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$APP/app" python3 -c 'import raofflineproxy.main; print("imports clean without pygame")' \
+            || { echo "package needs pygame"; fail=1; }
+
+          count=$(find "$APP" -type f | wc -l)
+          echo "bundle is $count files"
+          [ "$count" -lt 120 ] || { echo "bundle got fat again ($count files)"; fail=1; }
+
+          [ "$fail" = "0" ] || exit 1
+          echo "thin bundle: stdlib only, both rchash arches, no pygame"
+
+      - name: Upload bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="beta-${{ github.ref_name }}"
+          gh release upload "$TAG" \
+            linux/spruce/dist/RAOfflineProxy-Spruce-v${{ inputs.app_version }}.zip \
+            --clobber
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RAOfflineProxy-Spruce
+          path: linux/spruce/dist/*.zip
