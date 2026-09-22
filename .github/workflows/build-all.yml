@@ -1,0 +1,17 @@
+name: Build All
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: 'Bundle version (no leading v)'
+        default: '1.13.0-alpha1'
+
+permissions:
+  contents: write
+
+jobs:
+  spruce:
+    uses: ./.github/workflows/build-spruce.yml
+    with:
+      app_version: ${{ inputs.app_version }}

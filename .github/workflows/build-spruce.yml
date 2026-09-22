@@ -1,0 +1,122 @@
+name: Build RAOfflineProxy (spruce)
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: 'Bundle version (no leading v)'
+        default: '1.13.0-alpha1'
+  workflow_call:
+    inputs:
+      app_version:
+        type: string
+        default: '1.13.0-alpha1'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Ensure beta release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="beta-${{ github.ref_name }}"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" \
+              --target "${{ github.ref_name }}" \
+              --title "Beta Build (${{ github.ref_name }})" \
+              --prerelease \
+              --notes "RAOfflineProxy spruce bundle built from ${{ github.ref_name }}" \
+            || true
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y patchelf unzip
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      # ~700MB Miyoo toolchain and two CPython tarballs. Keyed on the fetch
+      # scripts so a runtime or vendor bump busts it and nothing else does.
+      - name: Restore runtime cache
+        uses: actions/cache@v4
+        with:
+          path: linux/onion/runtime-cache
+          key: raop-runtime-${{ hashFiles('linux/onion/fetch_runtime.sh', 'linux/onion/fetch_vendor.sh', 'linux/spruce/fetch_runtime_aarch64.sh') }}
+          restore-keys: raop-runtime-
+
+      - name: Fetch runtimes and vendor stacks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./linux/onion/fetch_runtime.sh
+          ./linux/spruce/fetch_runtime_aarch64.sh
+          ./linux/onion/fetch_vendor.sh
+          ./linux/spruce/fetch_vendor_aarch64.sh
+
+      - name: Build bundle
+        env:
+          RAOFFLINEPROXY_APP_VERSION: ${{ inputs.app_version }}
+          ZIG_BIN: zig
+        run: ./linux/spruce/build_bundle.sh
+
+      # A bundle that silently lost an arch still zips and still installs, and
+      # only fails on whichever devices we did not happen to test on.
+      - name: Verify both architectures are present
+        run: |
+          set -eu
+          APP=linux/spruce/dist/raofflineproxy-spruce-app/App/RAOfflineProxy
+          fail=0
+          for arch in armv7 aarch64; do
+            for f in "runtime/$arch/bin/python3" "lib/$arch/libraproxy_rchash.so"; do
+              if [ ! -e "$APP/$f" ]; then
+                echo "missing: $f"
+                fail=1
+              fi
+            done
+            if [ ! -d "$APP/runtime/$arch/lib/python3.9/site-packages/pygame" ]; then
+              echo "missing: pygame for $arch"
+              fail=1
+            fi
+          done
+
+          echo "--- rchash arch ---"
+          file "$APP/lib/armv7/libraproxy_rchash.so" | grep -q 'ARM'     || { echo "armv7 rchash is not ARM"; fail=1; }
+          file "$APP/lib/aarch64/libraproxy_rchash.so" | grep -q 'aarch64' || { echo "aarch64 rchash is not aarch64"; fail=1; }
+
+          # The whole point of the aarch64 lane: SDL2 must come from spruce.
+          if ls "$APP"/lib/aarch64/libSDL2-2*.so* >/dev/null 2>&1; then
+            echo "aarch64 payload still bundles SDL2"
+            fail=1
+          fi
+          if readelf -d "$APP"/runtime/aarch64/lib/python3.9/site-packages/pygame/base*.so \
+               | grep -o 'libSDL2[^]]*' | grep -qv '^libSDL2-2.0.so.0$'; then
+            echo "pygame still links a hashed SDL2 soname"
+            fail=1
+          fi
+
+          [ "$fail" = "0" ] || exit 1
+          echo "both architectures present and aarch64 SDL2 is unpinned"
+
+      - name: Upload bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="beta-${{ github.ref_name }}"
+          gh release upload "$TAG" \
+            linux/spruce/dist/RAOfflineProxy-Spruce-v${{ inputs.app_version }}.zip \
+            --clobber
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RAOfflineProxy-Spruce
+          path: linux/spruce/dist/*.zip
