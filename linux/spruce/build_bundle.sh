@@ -34,6 +34,12 @@ for arch in armv7 aarch64; do
   cp "${SCRIPT_DIR}/native/${arch}/libraproxy_rchash.so" "${APP_DIR}/lib/${arch}/libraproxy_rchash.so"
 done
 
+# menu_sdl is the only reader of these and it is not reachable without pygame.
+# The module itself stays: main.py imports it at module scope.
+rm -rf "${APP_DIR}/app/raofflineproxy/assets"
+rm -f "${APP_DIR}/app/raofflineproxy"/font-mono*.ttf
+rm -f "${APP_DIR}/app/raofflineproxy/logo-320.png"
+
 find "${APP_DIR}" -name "__pycache__" -type d -prune -exec rm -rf {} +
 find "${APP_DIR}" -name "*.pyc" -delete
 

@@ -79,6 +79,10 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$APP/app" python3 -c 'import raofflineproxy.main; print("imports clean without pygame")' \
             || { echo "package needs pygame"; fail=1; }
 
+          for dead in app/raofflineproxy/assets app/raofflineproxy/font-mono.ttf; do
+            [ -e "$APP/$dead" ] && { echo "menu-only asset shipped again: $dead"; fail=1; } || true
+          done
+
           count=$(find "$APP" -type f | wc -l)
           echo "bundle is $count files"
           [ "$count" -lt 120 ] || { echo "bundle got fat again ($count files)"; fail=1; }
