@@ -35,6 +35,8 @@
     <string name="proxy_stop">Stop proxy</string>
     <string name="proxy_started_success">Proxy started successfully.</string>
     <string name="proxy_stopped_success">Proxy stopped.</string>
+    <string name="permission_control_proxy_label">control RAOfflineProxy</string>
+    <string name="permission_control_proxy_description">Allows the app to start and stop the RAOfflineProxy proxy.</string>
     <string name="proxy_tooltip_online">Proxy running — online</string>
     <string name="proxy_tooltip_offline">Proxy running — offline</string>
     <string name="proxy_menu_title">Proxy</string>
@@ -50,7 +52,7 @@
     <string name="home_emulators_label">Enabled Emulators</string>
     <string name="home_manual_setup_warning">With your Android version (%1$s), automatic emulator setup will most likely not work on this device. Please consider using Manual Emulator Setup instead. Android builds can differ, so you can still try Start proxy with automatic setup if you want.</string>
     <string name="home_shizuku_info">You are running the proxy through Shizuku.</string>
-    <string name="home_no_emulator_warning">No supported emulator was found. Install RetroArch, Dolphin, PPSSPP, ARMSX2, Flycast, WatermelonDS, Mupen64Plus, EmuCoreX, or ARMSX1 to use RAOfflineProxy.</string>
+    <string name="home_no_emulator_warning">No supported emulator was found. Install RetroArch, Dolphin, PPSSPP, ARMSX2, Flycast, WatermelonDS, Mupen64Plus, EmuCoreX, ARMSX1, or NetherSX2 to use RAOfflineProxy.</string>
     <string name="home_go_to_cached_games">Cached Games</string>
     <string name="btn_support_development">💛 Support me</string>
     <string name="support_dialog_title">💛 Support RAOfflineProxy</string>
@@ -80,6 +82,7 @@
     <string name="emulator_mupen64">Mupen64Plus</string>
     <string name="emulator_emucorex">EmuCoreX</string>
     <string name="emulator_armsx1">ARMSX1</string>
+    <string name="emulator_nethersx2">NetherSX2</string>
     <string name="emulator_toggle_icon_cd">Installed emulator icon</string>
     <string name="emulator_selector_caret">▼</string>
     <string name="emulator_selector_cd">Enabled emulators, tap to change</string>
@@ -145,6 +148,8 @@
     <string name="emucorex_patch_error_unavailable">Could not patch EmuCoreX automatically. Make sure a supported EmuCoreX build is installed and try again.</string>
     <string name="armsx1_patch_success">ARMSX1 patched successfully.</string>
     <string name="armsx1_patch_error_unavailable">Could not patch ARMSX1 automatically. Make sure a supported ARMSX1 build is installed and try again.</string>
+    <string name="nethersx2_patch_success">NetherSX2 patched successfully.</string>
+    <string name="nethersx2_patch_error_unavailable">Could not patch NetherSX2 automatically. Make sure a supported NetherSX2 build is installed and try again.</string>
     <!-- CFG revert messages -->
     <string name="revert_already_reverted">Already reverted — no changes needed.</string>
     <string name="revert_success_saf">Reverted successfully via folder access.</string>
@@ -176,6 +181,8 @@
     <string name="emucorex_revert_error_unavailable">Could not revert EmuCoreX automatically. Reopen the app and try again.</string>
     <string name="armsx1_revert_success">ARMSX1 reverted successfully.</string>
     <string name="armsx1_revert_error_unavailable">Could not revert ARMSX1 automatically. Reopen the app and try again.</string>
+    <string name="nethersx2_revert_success">NetherSX2 reverted successfully.</string>
+    <string name="nethersx2_revert_error_unavailable">Could not revert NetherSX2 automatically. Reopen the app and try again.</string>
 
     <!-- Flush messages -->
     <string name="flush_started">Flushing awards…</string>
@@ -196,22 +203,19 @@
     <string name="request_failed_award_sync">Queued award sync failed for achievement #%1$d: %2$s</string>
 
     <!-- Scan / add ROM messages -->
-<string name="scan_hashing">Hashing file %1$d/%2$d…</string>
-    <string name="scan_looking_up">Looking up %1$d/%2$d: %3$s</string>
-    <string name="scan_add_complete">Added: %1$d of %2$d game(s) cached, %3$d skipped.</string>
-    <string name="scan_add_complete_limit">Added: %1$d of %2$d game(s) cached, %3$d skipped. Reached the %4$d-game cache limit.</string>
+<string name="caching_hashing_progress">Hashing %1$d/%2$d: %3$s</string>
+    <string name="caching_caching_progress">Caching %1$d/%2$d: %3$s</string>
+    <string name="scan_add_complete">Added: %1$d cached, %2$d queued, %3$d skipped.</string>
     <string name="scan_starting">Starting scan…</string>
     <string name="scan_aborting">Aborting scan…</string>
-    <string name="scan_progress">Scanning %1$d/%2$d: %3$s</string>
-    <string name="scan_complete">Scan complete: %1$d game(s) matched out of %2$d file(s), %3$d skipped.</string>
-    <string name="scan_complete_limit">Scan complete: %1$d game(s) matched out of %2$d file(s), %3$d skipped. Reached the %4$d-game cache limit.</string>
+    <string name="scan_complete">Scan complete: %1$d cached, %2$d queued, %3$d skipped.</string>
+    <string name="scan_cancelled">Scan cancelled. Nothing was cached.</string>
     <string name="scan_aborted">Scan aborted.</string>
     <string name="smart_cache_starting">Starting Smart Cache…</string>
     <string name="smart_cache_aborting">Aborting Smart Cache…</string>
     <string name="smart_cache_aborted">Smart Cache aborted.</string>
-    <string name="smart_cache_progress">Smart Cache %1$d/%2$d: %3$s</string>
-    <string name="smart_cache_complete">Smart Cache complete: %1$d game(s) cached from %2$d candidate(s), %3$d skipped.</string>
-    <string name="smart_cache_complete_limit">Smart Cache complete: %1$d game(s) cached from %2$d candidate(s), %3$d skipped. Reached the %4$d-game cache limit.</string>
+    <string name="smart_cache_complete">Smart Cache complete: %1$d cached, %2$d queued, %3$d skipped.</string>
+    <string name="caching_queue_hint">Queued games are cached in the background, up to %1$d every 30 minutes.</string>
     <string name="smart_cache_no_strategies">No enabled Smart Cache strategy is available.</string>
     <string name="smart_cache_requires_retroarch_access">Smart Cache needs access to RetroArch files to read recent history.</string>
     <string name="smart_cache_requires_dolphin_access">Smart Cache needs access to Dolphin\'s package folder to read recent games.</string>
@@ -302,6 +306,12 @@
     <string name="setting_app_update_check_caption">Checks for new app versions on startup</string>
     <string name="setting_hide_support_button_label">Hide "Support me"-button</string>
     <string name="setting_hide_support_button_caption">Hides the donation button on the home screen</string>
+    <string name="setting_usage_stats_label">Share anonymous usage statistics</string>
+    <string name="setting_usage_stats_caption">Sends device model, app version and cache sync numbers once a day. Your username is never sent.</string>
+    <string name="usage_stats_dialog_title">Help improve RAOfflineProxy</string>
+    <string name="usage_stats_dialog_message">Sharing anonymous statistics once a day would really help me understand how many people use RAOfflineProxy and how well caching works on their devices.\n\nSent: app version, device model, enabled emulators, and caching numbers (game counts, request counts, errors).\nNever sent: your username, password or achievements.\n\nYou can turn this off anytime in Settings.</string>
+    <string name="usage_stats_dialog_accept">Share statistics</string>
+    <string name="usage_stats_dialog_decline">No thanks</string>
     <string name="setting_show_locked_achievements_label">Show locked achievements</string>
     <string name="setting_show_locked_achievements_caption">Includes achievements you haven\'t unlocked yet in the achievements list</string>
     <string name="setting_autostart_caption">Starts the proxy automatically when the system boots</string>
@@ -318,8 +328,20 @@
     <string name="cached_games_scan_hint">Go online and make sure RAOfflineProxy has imported your RetroAchievements credentials to manage cached games.</string>
 
     <string name="cached_games_offline_hint">Go online to add, scan, or refresh cached games.</string>
-    <string name="cached_games_counter">%1$d/%2$d cached</string>
-    <string name="cached_games_limit_reached">You already have %d cached games. Clear some games to add more.</string>
+    <string name="cached_games_counter">%1$d cached</string>
+    <string name="cached_games_counter_queued">%1$d cached · %2$d queued</string>
+    <string name="cached_games_counter_with_queue_status">%1$s · %2$s</string>
+    <string name="cached_games_queue_next_batch">next batch %1$s</string>
+    <string name="cached_games_queue_next_batch_soon">next batch soon</string>
+    <string name="cached_games_queue_caching_now">caching now</string>
+    <string name="cached_games_counter_queued_paused">%1$d cached · %2$d queued (paused while the proxy is stopped)</string>
+
+    <!-- Caching queue confirmation -->
+    <string name="queue_confirm_title">Cache in the background?</string>
+    <string name="queue_confirm_message">Up to %1$d games are cached now, the other %2$d in the background: %3$d every 30 minutes while the proxy is running (about %4$s).</string>
+    <string name="queue_confirm_continue">Continue</string>
+    <string name="queue_eta_minutes">%1$d minutes</string>
+    <string name="queue_eta_hours">%1$d h %2$d min</string>
     <string name="cached_games_refresh">Refresh games</string>
     <string name="cached_games_smart_cache">Start Smart Cache</string>
     <string name="cached_games_add_rom">Add ROM</string>
@@ -349,6 +371,11 @@
     <string name="notification_offline_text">Serving from cache</string>
     <string name="notification_offline_active_text">Serving %1$s from cache</string>
     <string name="notification_offline_idle_text">Idle</string>
+    <string name="notification_caching_title">Caching games</string>
+    <string name="notification_hashing_short">Hashing %1$d/%2$d</string>
+    <string name="notification_caching_short">Caching %1$d/%2$d</string>
+    <string name="notification_caching_queue_waiting_short">%1$d queued</string>
+    <string name="notification_caching_queue_waiting">%1$d queued, next batch at %2$s</string>
     <plurals name="notification_pending_awards">
         <item quantity="one">%d pending award</item>
         <item quantity="other">%d pending awards</item>

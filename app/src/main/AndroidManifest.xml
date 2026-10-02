@@ -9,12 +9,19 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         tools:ignore="AllFilesAccessPolicy,ScopedStorage" />
     <!-- Legacy storage read access for older Android versions -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"
         tools:ignore="RequestInstallPackagesPolicy" />
+
+    <permission
+        android:name="${applicationId}.permission.CONTROL_PROXY"
+        android:label="@string/permission_control_proxy_label"
+        android:description="@string/permission_control_proxy_description"
+        android:protectionLevel="normal" />
 
     <queries>
         <package android:name="com.retroarch.aarch64" />
@@ -33,10 +40,12 @@
         <package android:name="org.mupen64plusae.v3.alpha.debug" />
         <package android:name="com.sbro.emucorex" />
         <package android:name="com.nanodata.armsx" />
+        <package android:name="xyz.aethersx2.android" />
         <package android:name="moe.shizuku.privileged.api" />
     </queries>
 
     <application
+        android:name=".RAOfflineProxyApplication"
         android:allowBackup="true"
         android:fullBackupContent="@xml/backup_rules"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -94,6 +103,10 @@
 
         <receiver
             android:name=".service.ProxyRestartReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".service.CacheQueueAlarmReceiver"
             android:exported="false" />
 
         <receiver

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from linux.tests.e2e.scenarios._miyoo_common import MiyooLifecycle
+from linux.tests.e2e.scenarios._usage_stats_common import UsageStatsChecks
 
 SPRUCE_VERSION_FILE = "/mnt/SDCARD/spruce/spruce"
 RA_CONFIG_DIR = "/mnt/SDCARD/Saves/ra-configs"
@@ -45,6 +48,21 @@ class TestSpruceLifecycle(MiyooLifecycle):
 
 
 class TestSpruceSpecific:
+    def test_cache_rom_json_is_what_spruce_parses(self, installed):
+        """spruce's raproxyCacheRom.sh reads "message" from the last line, strips "Cached " and
+        looks that title up in cached-games to find the game id."""
+        result = installed.cli.run("cache-rom --path %s --json" % installed.rom, check=True)
+
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        assert payload["success"] is True
+        assert payload["queued"] is False
+        assert payload["message"].startswith("Cached ")
+        title = payload["message"][len("Cached "):]
+        listing = installed.cli.run("cached-games", check=True).stdout.splitlines()
+        assert any(
+            line.startswith(title + " (") and line.endswith("##GAMEID:1447") for line in listing
+        )
+
     def test_detects_spruce_and_not_onion(self, installed):
         """spruce reuses Onion's App/ layout, so the version files are the only
         thing separating them."""
@@ -119,3 +137,17 @@ class TestSpruceSpecific:
         assert patched != original
         assert "autostart-launch.sh" in patched
         assert patched.startswith("#!")
+
+
+class TestUsageStats(UsageStatsChecks):
+    EXPECTED_OS = "spruce"
+
+    def grant_consent(self, installed) -> None:
+        # spruce has no menu of ours: its own UI asks and stores the answer through the CLI.
+        output = installed.cli.run("usage-stats-status --json", check=True).stdout
+        status = json.loads(output.strip().splitlines()[-1])
+        assert status["consent"] is None
+        assert status["accept"] == "Share statistics"
+        installed.cli.run("enable-usage-stats", check=True)
+        status_line = installed.cli.run("usage-stats-status", check=True).stdout.strip().splitlines()[-1]
+        assert status_line == "enabled"

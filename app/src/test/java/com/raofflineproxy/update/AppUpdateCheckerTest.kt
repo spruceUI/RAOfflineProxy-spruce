@@ -1,5 +1,6 @@
 package com.raofflineproxy.update
 
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -86,5 +87,78 @@ class AppUpdateCheckerTest {
     fun isUpdateNewerThanCurrent_returnsFalse_forSameOrOlderVersion() {
         assertEquals(false, AppUpdateChecker.isUpdateNewerThanCurrent("1.3.0-alpha1", "1.3.0-alpha1"))
         assertEquals(false, AppUpdateChecker.isUpdateNewerThanCurrent("1.3.0-alpha1", "1.0.0"))
+    }
+
+    @Test
+    fun selectLatestUpdate_ignoresNightly_forStableInstall() {
+        val releases = listOfNotNull(releaseInfo("1.3.0-alpha1-nightly.57"))
+
+        val result = AppUpdateChecker.selectLatestUpdate("1.3.0-alpha1", releases)
+
+        assertNull(result)
+    }
+
+    @Test
+    fun selectLatestUpdate_returnsNewerNightly_forNightlyInstall() {
+        val releases = listOfNotNull(
+            releaseInfo("1.3.0-alpha1"),
+            releaseInfo("1.3.0-alpha1-nightly.58")
+        )
+
+        val result = AppUpdateChecker.selectLatestUpdate("1.3.0-alpha1-nightly.57", releases)
+
+        assertEquals("1.3.0-alpha1-nightly.58", result?.versionName)
+    }
+
+    @Test
+    fun selectLatestUpdate_ignoresStableOfSameBase_forNightlyInstall() {
+        val releases = listOfNotNull(releaseInfo("1.3.0-alpha1"))
+
+        val result = AppUpdateChecker.selectLatestUpdate("1.3.0-alpha1-nightly.57", releases)
+
+        assertNull(result)
+    }
+
+    @Test
+    fun selectLatestUpdate_returnsNewerStable_forNightlyInstall() {
+        val releases = listOfNotNull(
+            releaseInfo("1.3.0-alpha1-nightly.57"),
+            releaseInfo("1.3.0-alpha2")
+        )
+
+        val result = AppUpdateChecker.selectLatestUpdate("1.3.0-alpha1-nightly.57", releases)
+
+        assertEquals("1.3.0-alpha2", result?.versionName)
+    }
+
+    @Test
+    fun selectLatestUpdate_prefersNightlyOverStableOfSameBase() {
+        val releases = listOfNotNull(
+            releaseInfo("1.3.0-alpha2"),
+            releaseInfo("1.3.0-alpha2-nightly.60")
+        )
+
+        val result = AppUpdateChecker.selectLatestUpdate("1.3.0-alpha1-nightly.57", releases)
+
+        assertEquals("1.3.0-alpha2-nightly.60", result?.versionName)
+    }
+
+    @Test
+    fun nightlyVersionName_readsVersionAfterPlatformLabel() {
+        val release = JSONObject().put("name", "Android 1.3.0-alpha1-nightly.57")
+
+        assertEquals("1.3.0-alpha1-nightly.57", AppUpdateChecker.nightlyVersionName(release))
+    }
+
+    @Test
+    fun nightlyVersionName_acceptsBareVersionTitle() {
+        val release = JSONObject().put("name", "1.3.0-alpha1-nightly.57")
+
+        assertEquals("1.3.0-alpha1-nightly.57", AppUpdateChecker.nightlyVersionName(release))
+    }
+
+    @Test
+    fun isUpdateNewerThanCurrent_rejectsMalformedNightly() {
+        assertEquals(false, AppUpdateChecker.isUpdateNewerThanCurrent("1.3.0-alpha1", "1.3.0-alpha1-nightly."))
     }
 }

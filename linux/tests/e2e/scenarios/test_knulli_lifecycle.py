@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from linux.tests.e2e.scenarios._usage_stats_common import UsageStatsChecks
 
 USER = "testuser"
 TOKEN = "tok-testuser-000000000001"
@@ -150,6 +151,57 @@ class TestCaching:
         installed.cli.run("clear-cached-games", check=True)
         assert installed.cli.cached_game_count() == 0
 
+    def test_rescanning_a_cached_rom_sends_nothing_to_ra(self, installed):
+        installed.cli.run("cache-rom --path %s" % installed.rom, check=True)
+        installed.ra.clear_journal()
+
+        result = installed.cli.run("cache-rom --path %s" % installed.rom, check=True)
+
+        assert "Already cached" in result.stdout
+        assert installed.cli.cached_game_count() == 1
+        assert installed.ra.actions() == []
+
+    def test_unknown_rom_lookup_is_cached(self, installed):
+        # .7z arcade sets hash by file name, so a renamed copy is a game RA does not know.
+        unknown_rom = "%s/not-on-ra.7z" % installed.device.rom_dir
+        installed.container.exec(
+            "cp %s %s" % (installed.rom, unknown_rom),
+            check=True,
+            user=installed.device.run_as,
+        )
+        installed.ra.clear_journal()
+
+        first = installed.cli.run("cache-rom --path %s" % unknown_rom)
+        assert "No RetroAchievements match" in first.stdout + first.stderr
+        assert installed.ra.actions() == ["gameid"]
+
+        installed.ra.clear_journal()
+        installed.cli.run("cache-rom --path %s" % unknown_rom)
+        assert installed.ra.actions() == []
+        assert installed.cli.cached_game_count() == 0
+
+    def test_cache_roms_reports_each_rom_and_a_summary(self, installed):
+        # The ES fork's "cache all displayed games" parses these lines, so their format is a
+        # contract.
+        rom_dir = installed.device.rom_dir
+        unknown_rom = "%s/not-on-ra.7z" % rom_dir
+        paths_file = "/tmp/raofflineproxy-paths.txt"
+        installed.container.exec(
+            "cp %s %s && printf '%%s\\n' %s %s %s/missing.7z > %s"
+            % (installed.rom, unknown_rom, installed.rom, unknown_rom, rom_dir, paths_file),
+            check=True,
+            user=installed.device.run_as,
+        )
+
+        result = installed.cli.run("cache-roms --paths-file %s" % paths_file, check=True)
+
+        lines = result.stdout.strip().splitlines()
+        assert "OK 1/3 mslug.7z" in lines
+        assert "FAIL 2/3 not-on-ra.7z: No RetroAchievements match" in lines
+        assert "FAIL 3/3 missing.7z: not found" in lines
+        assert lines[-1] == "DONE cached=1 failed=2 queued=0"
+        assert installed.cli.cached_game_count() == 1
+
     def test_launching_a_game_online_caches_it(self, installed):
         installed.cli.run("start-proxy", check=True)
         responses = installed.emulator.boot_sequence(USER, TOKEN, MSLUG_HASH)
@@ -238,3 +290,7 @@ class TestUninstall:
 
         conf = installed.container.read_file(installed.device.batocera_conf)
         assert conf_value(conf, "global.retroachievements.hardcore") == "1"
+
+
+class TestUsageStats(UsageStatsChecks):
+    EXPECTED_OS = "Knulli"

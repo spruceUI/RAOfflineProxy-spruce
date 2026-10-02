@@ -5,7 +5,6 @@ import android.net.Uri
 import android.os.Build
 import android.util.Log
 import androidx.documentfile.provider.DocumentFile
-import com.raofflineproxy.MAX_CACHED_GAMES
 import com.raofflineproxy.R
 import com.raofflineproxy.RA_HOST
 import com.raofflineproxy.RequestFailureNotifier
@@ -23,35 +22,67 @@ import com.raofflineproxy.data.PENDING_AWARD_STATUS_PENDING
 import com.raofflineproxy.data.PendingAward
 import com.raofflineproxy.proxyUserAgent
 import com.raofflineproxy.parseFormParams
+import com.raofflineproxy.usage.RaRequestSource
+import com.raofflineproxy.usage.UsageStats
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.math.min
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.supervisorScope
 
 private const val TAG = "RAProxy"
 private const val HTTP_ERROR_BODY_LOG_LIMIT = 512
 private const val HTTP_TOO_MANY_REQUESTS = 429
 private const val HTTP_RETRY_AFTER_HEADER = "Retry-After"
+
 private const val HTTP_GET_MAX_429_RETRIES = 4
 private const val HTTP_GET_INITIAL_429_BACKOFF_MS = 2_000L
 private const val HTTP_GET_MAX_429_BACKOFF_MS = 15_000L
-private const val SCAN_CACHE_PIPELINE_LIMIT = 6
 private const val MAX_SCAN_ENTRIES = 5000
 private const val MAX_SCAN_DEPTH = 12
+// RetroAchievements adds hashes over time, so a "no match" is only cached long enough to
+// stop a repeated scan of the same folder from re-querying every unsupported ROM.
+private const val GAMEID_MISS_TTL_MS = 7L * 24 * 60 * 60 * 1000
 
 private val FALLBACK_USER_AGENT = "RetroArch/1.21.0 (Android ${Build.VERSION.RELEASE ?: "Unknown"})"
 
 data class ScanResult(
-    val matched: Int,
     val total: Int,
     val skipped: Int,
-    val limitReached: Boolean = false
+    val queued: Int = 0,
+    val cancelled: Boolean = false
 )
+
+internal sealed interface CachedGameIdLookup {
+    data class Match(val gameId: Int) : CachedGameIdLookup
+    data object NoMatch : CachedGameIdLookup
+    data object Unknown : CachedGameIdLookup
+}
+
+internal sealed interface LocalGameIdAnswer {
+    data class Match(val hash: String, val gameId: Int) : LocalGameIdAnswer
+    data object NoMatch : LocalGameIdAnswer
+    data object NeedsLookup : LocalGameIdAnswer
+}
+
+internal sealed interface GameIdLookup {
+    data class Match(val hash: String, val gameId: Int) : GameIdLookup
+    data object NoMatch : GameIdLookup
+    data class Failed(val authError: Boolean) : GameIdLookup
+}
+
+internal enum class DrainStop { Empty, BudgetExhausted, RateLimited, Paused, Failed, AuthRejected, Busy }
+
+internal data class QueueDrainResult(
+    val cached: Int,
+    val noMatch: Int,
+    val stop: DrainStop,
+    val nextAttemptAt: Long? = null,
+    val timeLimited: Boolean = false
+) {
+    val processed: Int get() = cached + noMatch
+}
 
 internal suspend fun loadCachedRomPaths(db: AppDatabase): MutableSet<String> =
     db.cacheDao().getAllByPrefix(CacheKeys.PREFIX_PATCH)
@@ -240,14 +271,8 @@ internal suspend fun loadCachedGameRefreshTargets(db: AppDatabase): List<CachedG
         achievementSetEntries.forEach { entry ->
             val user = CacheKeys.parseUserFromAchievementSetsKey(entry.cacheKey) ?: return@forEach
             val hash = CacheKeys.parseAchievementSetsHash(entry.cacheKey) ?: return@forEach
-            val gameId = runCatching {
-                JSONObject(normalizeCachedResponse("achievementsets", "", "u=$user&m=$hash", entry.responseBody))
-                    .getJSONObject("PatchData")
-                    .optInt("ID")
-            }.getOrDefault(0)
-            if (gameId > 0) {
-                putIfAbsent(gameId to user, hash)
-            }
+            val gameId = achievementSetsGameId(entry) ?: return@forEach
+            putIfAbsent(gameId to user, hash)
         }
     }
 
@@ -265,6 +290,29 @@ internal suspend fun loadCachedGameRefreshTargets(db: AppDatabase): List<CachedG
     }
 }
 
+private fun achievementSetsGameId(entry: CacheEntry): Int? {
+    val user = CacheKeys.parseUserFromAchievementSetsKey(entry.cacheKey) ?: return null
+    val hash = CacheKeys.parseAchievementSetsHash(entry.cacheKey) ?: return null
+    return runCatching {
+        JSONObject(normalizeCachedResponse("achievementsets", "", "u=$user&m=$hash", entry.responseBody))
+            .getJSONObject("PatchData")
+            .optInt("ID")
+    }.getOrDefault(0).takeIf { it > 0 }
+}
+
+internal suspend fun deleteCachedGamesData(db: AppDatabase, gameIds: Set<String>) {
+    val dao = db.cacheDao()
+    gameIds.forEach { gameId ->
+        dao.deleteByKeyPrefix(CacheKeys.patchPrefix(gameId))
+        dao.deleteByKeyPrefix(CacheKeys.unlocksPrefix(gameId))
+        dao.deleteByKeyPrefix(CacheKeys.startSessionPrefix(gameId))
+        gameId.toIntOrNull()?.let { dao.deleteByKey(CacheKeys.lastPlayed(it)) }
+    }
+    dao.getAllByPrefix(CacheKeys.PREFIX_ACHIEVEMENTSETS)
+        .filter { entry -> achievementSetsGameId(entry)?.toString() in gameIds }
+        .forEach { entry -> dao.deleteByKey(entry.cacheKey) }
+}
+
 internal suspend fun refreshCachedGameOfflineBundle(
     context: Context,
     target: CachedGameRefreshTarget,
@@ -273,7 +321,9 @@ internal suspend fun refreshCachedGameOfflineBundle(
     db: AppDatabase,
     notificationMode: RefreshNotificationMode,
     cacheImages: Boolean = true,
+    awaitImages: Boolean = false,
 ): Boolean {
+    val inlineImages = mutableListOf<ImageDownload>()
     val action = if (target.endpoint == RefreshEndpoint.AchievementSets && !target.romHash.isNullOrBlank()) {
         "achievementsets"
     } else {
@@ -327,7 +377,8 @@ internal suspend fun refreshCachedGameOfflineBundle(
             if (cacheImages) {
                 val proxyBaseUrl = "http://${proxyHost()}:${proxyPort(context)}"
                 rewriteImageUrls(action, result.body, proxyBaseUrl) { originalUrl, imagePath ->
-                    scheduleImageDownload(context, originalUrl, imagePath, userAgent, target.gameId)
+                    if (awaitImages) inlineImages += ImageDownload(originalUrl, imagePath)
+                    else scheduleImageDownload(context, originalUrl, imagePath, userAgent, target.gameId)
                 }
             }
         }
@@ -345,6 +396,7 @@ internal suspend fun refreshCachedGameOfflineBundle(
 
     val unlocksOk = cacheUnlocks(context, target.gameId, creds, userAgent, db, notificationMode)
     cacheSession(target.gameId, creds, db)
+    downloadImagesInline(context, inlineImages, userAgent, target.gameId)
     Log.i(TAG, "refreshCachedGameOfflineBundle complete for gameId=${target.gameId} endpoint=$action")
     return unlocksOk
 }
@@ -362,17 +414,20 @@ private fun reportRefreshFailure(
     }
 }
 
+/** Hashes every scannable file and queues what RA has to answer. No request to RA happens here:
+ *  [drainCacheQueue] does all of that within the caching budget. */
 suspend fun scanRomFolder(
     context: Context,
     treeUri: Uri,
-    credentials: LoginCredentials,
-    userAgent: String,
     db: AppDatabase,
     singleFile: Boolean = false,
+    confirmLargeQueue: suspend (QueueEstimate) -> Boolean = { true },
+    onQueued: (key: String) -> Unit = {},
     onProgress: (current: Int, total: Int, fileName: String) -> Unit
 ): ScanResult {
     val cachedGameIds = loadCachedGameIds(db)
     val cachedRomPaths = loadCachedRomPaths(db)
+    val queuedRomPaths = CacheQueue.queuedRomPaths(db)
     val files: List<DocumentFile> = if (singleFile) {
         val f = DocumentFile.fromSingleUri(context, treeUri)
         if (f != null && shouldScanFile(f)) listOf(f) else emptyList()
@@ -381,78 +436,243 @@ suspend fun scanRomFolder(
             ?: emptyList()
     }
     val total = files.size
+    val sourceRomPaths = files.map(::resolveDocumentAbsolutePath)
+    val estimate = estimateQueueForPaths(db, sourceRomPaths, cachedRomPaths, queuedRomPaths)
+    if (estimate.needsConfirmation && !confirmLargeQueue(estimate)) {
+        return ScanResult(total = total, skipped = 0, cancelled = true)
+    }
     var skipped = 0
-    var matched = 0
-    var limitReached = false
-    val inFlight = ArrayDeque<kotlinx.coroutines.Deferred<Boolean>>()
+    var queued = 0
+    for ((index, file) in files.withIndex()) {
+        onProgress(index + 1, total, file.name ?: "")
+        val sourceRomPath = sourceRomPaths[index]
+        val normalizedPath = sourceRomPath?.normalizeCachedRomPath()
+        if (normalizedPath != null && normalizedPath in cachedRomPaths) {
+            skipped++
+            continue
+        }
+        if (normalizedPath != null && normalizedPath in queuedRomPaths) {
+            queued++
+            continue
+        }
+        val candidates = hashRomCandidates(context, file)
+        if (enqueueRomIfNeeded(db, candidates, cachedGameIds, sourceRomPath, file.name ?: "", onQueued)) queued++ else skipped++
+    }
+    return ScanResult(total = total, skipped = skipped, queued = queued)
+}
 
-    supervisorScope {
-        for ((index, file) in files.withIndex()) {
-            if (cachedGameIds.size >= MAX_CACHED_GAMES) {
-                skipped += total - index
-                limitReached = true
-                break
-            }
-            applyScanBatchCooldown(index, TAG)
+internal suspend fun estimateQueueForDocuments(context: Context, db: AppDatabase, uris: List<Uri>): QueueEstimate {
+    val sourceRomPaths = uris.map { uri -> DocumentFile.fromSingleUri(context, uri)?.let(::resolveDocumentAbsolutePath) }
+    return estimateQueueForPaths(db, sourceRomPaths, loadCachedRomPaths(db), CacheQueue.queuedRomPaths(db))
+}
 
-            onProgress(index + 1, total, file.name ?: "")
-            val sourceRomPath = resolveDocumentAbsolutePath(file)
-            val normalizedPath = sourceRomPath?.normalizeCachedRomPath()
-            if (normalizedPath != null && normalizedPath in cachedRomPaths) {
-                skipped++
-                continue
-            }
-            val candidates = hashRomCandidates(context, file)
-            val resolved = resolveGameId(context, candidates, credentials, userAgent, db)
-            if (resolved == null) {
-                skipped++
-                continue
-            }
-            val (hash, gameId) = resolved
-            val gameIdString = gameId.toString()
-            if (gameIdString in cachedGameIds) {
-                skipped++
-                continue
-            }
+internal suspend fun estimateQueueForPaths(
+    db: AppDatabase,
+    sourceRomPaths: List<String?>,
+    cachedRomPaths: Set<String>,
+    queuedRomPaths: Set<String>
+): QueueEstimate {
+    val alreadyKnown = sourceRomPaths.count { path ->
+        val normalized = path?.normalizeCachedRomPath()
+        normalized != null && (normalized in cachedRomPaths || normalized in queuedRomPaths)
+    }
+    return estimateQueue(
+        candidates = sourceRomPaths.size,
+        alreadyKnown = alreadyKnown,
+        budgetRemaining = CacheBudget.remaining(db),
+        queuedNow = CacheQueue.count(db)
+    )
+}
 
-            cachedGameIds.add(gameIdString)
-            if (normalizedPath != null) {
-                cachedRomPaths.add(normalizedPath)
-            }
+/** Queues a hashed ROM unless the local cache already answers it: an already-cached game or a
+ *  fresh cached no-match costs RA nothing. Returns whether the ROM is waiting in the queue;
+ *  [onQueued] only hears about rows this call actually added. */
+internal suspend fun enqueueRomIfNeeded(
+    db: AppDatabase,
+    candidates: List<String>,
+    cachedGameIds: Set<String>,
+    sourceRomPath: String?,
+    label: String,
+    onQueued: (key: String) -> Unit = {},
+    now: Long = System.currentTimeMillis()
+): Boolean {
+    when (val local = localGameIdAnswer(db, candidates, now)) {
+        LocalGameIdAnswer.NoMatch -> return false
+        is LocalGameIdAnswer.Match -> if (local.gameId.toString() in cachedGameIds) return false
+        LocalGameIdAnswer.NeedsLookup -> Unit
+    }
+    val rom = QueuedRom(candidates, sourceRomPath, label, now)
+    if (CacheQueue.enqueue(db, rom)) onQueued(rom.key)
+    return true
+}
 
-            inFlight += async {
-                cacheGame(
-                    context = context,
-                    gameId = gameId,
-                    creds = credentials,
-                    userAgent = userAgent,
-                    db = db,
-                    romHash = hash,
-                    sourceRomPath = sourceRomPath
-                )
-                true
-            }
+/** Answers a ROM's game id from the local gameid cache alone, walking candidates in the same
+ *  order as [resolveGameId]. */
+internal suspend fun localGameIdAnswer(db: AppDatabase, candidates: List<String>, now: Long): LocalGameIdAnswer {
+    for (hash in candidates) {
+        val cached = db.cacheDao().get(CacheKeys.gameId(hash))
+        when (val lookup = classifyCachedGameId(cached?.responseBody, cached?.cachedAt ?: 0L, now)) {
+            is CachedGameIdLookup.Match -> return LocalGameIdAnswer.Match(hash, lookup.gameId)
+            CachedGameIdLookup.NoMatch -> continue
+            CachedGameIdLookup.Unknown -> return LocalGameIdAnswer.NeedsLookup
+        }
+    }
+    return LocalGameIdAnswer.NoMatch
+}
 
-            if (inFlight.size >= SCAN_CACHE_PIPELINE_LIMIT) {
-                if (inFlight.removeFirst().await()) {
-                    matched++
+internal fun classifyCachedGameId(body: String?, cachedAt: Long, now: Long): CachedGameIdLookup {
+    if (body == null) return CachedGameIdLookup.Unknown
+    val gameId = runCatching { JSONObject(body).optInt("GameID", 0) }.getOrNull() ?: return CachedGameIdLookup.Unknown
+    return when {
+        gameId > 0 -> CachedGameIdLookup.Match(gameId)
+        now - cachedAt < GAMEID_MISS_TTL_MS -> CachedGameIdLookup.NoMatch
+        else -> CachedGameIdLookup.Unknown
+    }
+}
+
+/** The single place that sends RA requests for bulk caching: works through the queue oldest
+ *  first within the caching budget. A window allows [CACHE_BUDGET_LIMIT] cached games; ROMs
+ *  RetroAchievements doesn't know don't count. A batch ends after [CACHE_BATCH_MAX_MS] at the
+ *  latest and leaves the rest for the next window. A 429 stops the queue for at least
+ *  [RATE_LIMIT_PAUSE_MS]. Only one caller drains at a time; a concurrent call returns
+ *  [DrainStop.Busy] at once. A failed ROM keeps its place and is retried on a later round instead
+ *  of back to back. [onItem] reports progress in games within the current window. */
+internal suspend fun drainCacheQueue(
+    context: Context,
+    db: AppDatabase,
+    creds: LoginCredentials,
+    userAgent: String,
+    shouldPause: () -> Boolean,
+    waitForLock: Boolean = false,
+    onItem: suspend (current: Int, total: Int, label: String) -> Unit = { _, _, _ -> }
+): QueueDrainResult {
+    if (waitForLock) CacheQueue.drainLock.lock()
+    else if (!CacheQueue.drainLock.tryLock()) return QueueDrainResult(0, 0, DrainStop.Busy)
+    RateLimitBackoff.enterBackground()
+    try {
+        var cached = 0
+        var noMatch = 0
+        var requested = 0
+        val startedAt = System.currentTimeMillis()
+        val stopAt = startedAt + CACHE_BATCH_MAX_MS
+        fun result(stop: DrainStop, nextAttemptAt: Long? = null, timeLimited: Boolean = false) =
+            QueueDrainResult(cached, noMatch, stop, nextAttemptAt, timeLimited)
+                .also { UsageStats.recordBatch(it, System.currentTimeMillis() - startedAt) }
+        suspend fun rateLimited(): QueueDrainResult? {
+            val until = RateLimitBackoff.pausedUntil() ?: return null
+            CacheBudget.pauseUntil(db, until)
+            Log.w(TAG, "Cache queue paused: RetroAchievements answered 429")
+            return result(DrainStop.RateLimited, until)
+        }
+        while (true) {
+            if (shouldPause()) return result(DrainStop.Paused)
+            rateLimited()?.let { return it }
+            if (System.currentTimeMillis() >= stopAt) {
+                val windowEnd = CacheBudget.windowEndsAt(db)
+                CacheBudget.pauseUntil(db, windowEnd)
+                Log.i(TAG, "Cache queue: batch time limit reached, rest waits for the next window")
+                return result(DrainStop.BudgetExhausted, windowEnd, timeLimited = true)
+            }
+            val rom = CacheQueue.oldest(db) ?: return result(DrainStop.Empty)
+            val now = System.currentTimeMillis()
+            val cachedGameIds = loadCachedGameIds(db)
+            val local = localGameIdAnswer(db, rom.hashes, now)
+            when (local) {
+                LocalGameIdAnswer.NoMatch -> {
+                    CacheQueue.remove(db, rom)
+                    noMatch++
+                    continue
+                }
+                is LocalGameIdAnswer.Match -> if (local.gameId.toString() in cachedGameIds) {
+                    CacheQueue.remove(db, rom)
+                    continue
+                }
+                LocalGameIdAnswer.NeedsLookup -> Unit
+            }
+            val gamesLeft = CacheBudget.remaining(db, now)
+            if (gamesLeft == 0) return result(DrainStop.BudgetExhausted, CacheBudget.nextAvailableAt(db, now))
+            applyScanBatchCooldown(requested, TAG)
+            onItem(cached + 1, windowProgressTotal(cached, CacheQueue.count(db), gamesLeft), rom.label)
+            requested++
+            val outcome = cacheQueuedRom(context, db, creds, userAgent, rom, local, cachedGameIds)
+            if (outcome == QueuedRomOutcome.Cached) CacheBudget.chargeGame(db)
+            rateLimited()?.let { return it }
+            when (outcome) {
+                QueuedRomOutcome.Cached -> {
+                    CacheQueue.remove(db, rom)
+                    cached++
+                }
+                QueuedRomOutcome.NoMatch -> {
+                    CacheQueue.remove(db, rom)
+                    noMatch++
+                }
+                QueuedRomOutcome.AlreadyCached -> CacheQueue.remove(db, rom)
+                QueuedRomOutcome.AuthRejected -> {
+                    Log.w(TAG, "Cache queue paused: RetroAchievements rejected the login")
+                    return result(DrainStop.AuthRejected)
+                }
+                QueuedRomOutcome.Failed -> {
+                    recordFailedAttempt(db, rom)
+                    return result(DrainStop.Failed)
                 }
             }
         }
+    } finally {
+        RateLimitBackoff.leaveBackground()
+        CacheQueue.drainLock.unlock()
+    }
+}
 
-        inFlight.toList().awaitAll().forEach { completed ->
-            if (completed) {
-                matched++
-            }
+private enum class QueuedRomOutcome { Cached, NoMatch, AlreadyCached, Failed, AuthRejected }
+
+private suspend fun cacheQueuedRom(
+    context: Context,
+    db: AppDatabase,
+    creds: LoginCredentials,
+    userAgent: String,
+    rom: QueuedRom,
+    local: LocalGameIdAnswer,
+    cachedGameIds: Set<String>
+): QueuedRomOutcome {
+    val lookup = if (local is LocalGameIdAnswer.Match) {
+        GameIdLookup.Match(local.hash, local.gameId)
+    } else {
+        resolveGameIdResult(context, rom.hashes, creds, userAgent, db, reportFailures = false)
+    }
+    return when (lookup) {
+        GameIdLookup.NoMatch -> QueuedRomOutcome.NoMatch
+        is GameIdLookup.Failed -> if (lookup.authError) QueuedRomOutcome.AuthRejected else QueuedRomOutcome.Failed
+        is GameIdLookup.Match -> when {
+            lookup.gameId.toString() in cachedGameIds -> QueuedRomOutcome.AlreadyCached
+            cacheGame(
+                context = context,
+                gameId = lookup.gameId,
+                creds = creds,
+                userAgent = userAgent,
+                db = db,
+                romHash = lookup.hash,
+                sourceRomPath = rom.sourceRomPath,
+                awaitImages = true,
+                notificationMode = RefreshNotificationMode.Background
+            ) -> QueuedRomOutcome.Cached
+            else -> QueuedRomOutcome.Failed
         }
     }
+}
 
-    return ScanResult(
-        matched = matched,
-        total = total,
-        skipped = skipped,
-        limitReached = limitReached
-    )
+/** Games this drain can still cache in the current window, counting the one in progress:
+ *  bounded by what is queued and by the games left in the budget. */
+internal fun windowProgressTotal(cachedBefore: Int, queuedIncludingCurrent: Int, gamesLeft: Int): Int =
+    cachedBefore + minOf(queuedIncludingCurrent, gamesLeft).coerceAtLeast(1)
+
+private suspend fun recordFailedAttempt(db: AppDatabase, rom: QueuedRom) {
+    val retry = rom.afterFailedAttempt()
+    if (retry == null) {
+        Log.w(TAG, "Cache queue dropped ${rom.label} after $CACHE_QUEUE_MAX_ATTEMPTS failed attempts")
+        CacheQueue.remove(db, rom)
+    } else {
+        CacheQueue.update(db, retry)
+    }
 }
 
 internal suspend fun loadCachedGameIds(db: AppDatabase): MutableSet<String> =
@@ -540,13 +760,37 @@ internal suspend fun resolveGameId(
     creds: LoginCredentials,
     userAgent: String,
     db: AppDatabase
-): Pair<String, Int>? {
+): Pair<String, Int>? =
+    (resolveGameIdResult(context, candidates, creds, userAgent, db) as? GameIdLookup.Match)
+        ?.let { it.hash to it.gameId }
+
+internal suspend fun resolveGameIdResult(
+    context: Context,
+    candidates: List<String>,
+    creds: LoginCredentials,
+    userAgent: String,
+    db: AppDatabase,
+    reportFailures: Boolean = true
+): GameIdLookup {
+    var failure: GameIdLookup.Failed? = null
     for (hash in candidates) {
-        val gameId = fetchGameId(context, hash, creds, userAgent, db)
-        if (gameId != null) return hash to gameId
+        when (val lookup = fetchGameIdResult(context, hash, creds, userAgent, db, reportFailures)) {
+            is GameIdLookup.Match -> return lookup
+            GameIdLookup.NoMatch -> continue
+            is GameIdLookup.Failed -> {
+                if (lookup.authError || RateLimitBackoff.inBackground && RateLimitBackoff.pausedUntil() != null) return lookup
+                failure = lookup
+            }
+        }
     }
-    return null
+    return failure ?: GameIdLookup.NoMatch
 }
+
+internal fun isCacheableGameIdResponse(body: String): Boolean =
+    runCatching {
+        val payload = JSONObject(body)
+        payload.optInt("GameID", 0) > 0 || payload.optBoolean("Success", false)
+    }.getOrDefault(false)
 
 internal suspend fun fetchGameId(
     context: Context,
@@ -554,17 +798,29 @@ internal suspend fun fetchGameId(
     creds: LoginCredentials,
     userAgent: String,
     db: AppDatabase
-): Int? =
+): Int? = (fetchGameIdResult(context, hash, creds, userAgent, db) as? GameIdLookup.Match)?.gameId
+
+private suspend fun fetchGameIdResult(
+    context: Context,
+    hash: String,
+    creds: LoginCredentials,
+    userAgent: String,
+    db: AppDatabase,
+    reportFailures: Boolean = true
+): GameIdLookup =
     run {
-        db.cacheDao().get(CacheKeys.gameId(hash))
-            ?.responseBody
-            ?.let { cachedBody ->
-                val cachedGameId = runCatching { JSONObject(cachedBody).optInt("GameID", 0) }.getOrDefault(0)
-                if (cachedGameId > 0) {
-                    Log.i(TAG, "fetchGameId cache hit for hash=$hash gameId=$cachedGameId")
-                    return@run cachedGameId
-                }
+        val cached = db.cacheDao().get(CacheKeys.gameId(hash))
+        when (val lookup = classifyCachedGameId(cached?.responseBody, cached?.cachedAt ?: 0L, System.currentTimeMillis())) {
+            is CachedGameIdLookup.Match -> {
+                Log.i(TAG, "fetchGameId cache hit for hash=$hash gameId=${lookup.gameId}")
+                return@run GameIdLookup.Match(hash, lookup.gameId)
             }
+            CachedGameIdLookup.NoMatch -> {
+                Log.i(TAG, "fetchGameId cached no-match for hash=$hash")
+                return@run GameIdLookup.NoMatch
+            }
+            CachedGameIdLookup.Unknown -> Unit
+        }
 
         val url = buildApiUrl(
             RA_HOST,
@@ -578,26 +834,30 @@ internal suspend fun fetchGameId(
         when (val result = httpGet(url, userAgent)) {
             is HttpGetResult.Success -> {
                 val gameId = runCatching { JSONObject(result.body).optInt("GameID", 0) }.getOrDefault(0)
-                if (gameId > 0) {
+                if (isCacheableGameIdResponse(result.body)) {
                     db.cacheDao().upsert(
                         CacheEntry(
                             cacheKey = CacheKeys.gameId(hash),
                             responseBody = result.body
                         )
                     )
+                }
+                if (gameId > 0) {
                     Log.i(TAG, "fetchGameId matched hash=$hash gameId=$gameId")
-                    gameId
+                    GameIdLookup.Match(hash, gameId)
                 } else {
                     Log.i(TAG, "fetchGameId no match for hash=$hash body=${result.body}")
-                    null
+                    GameIdLookup.NoMatch
                 }
             }
 
             is HttpGetResult.Failure -> {
                 val logDetails = result.logMessage("gameid", url)
                 Log.e(TAG, "fetchGameId failed for hash=$hash: $logDetails")
-                RequestFailureNotifier.report(result.userMessage(context, "gameid"), logDetails)
-                null
+                if (reportFailures) {
+                    RequestFailureNotifier.report(result.userMessage(context, "gameid"), logDetails)
+                }
+                GameIdLookup.Failed(authError = result.statusCode == 401 || result.statusCode == 403)
             }
         }
     }
@@ -611,7 +871,9 @@ internal suspend fun cacheGame(
     romHash: String? = null,
     sourceRomPath: String? = null,
     cacheImages: Boolean = true,
-) {
+    awaitImages: Boolean = false,
+    notificationMode: RefreshNotificationMode = RefreshNotificationMode.Foreground,
+): Boolean =
     refreshCachedGameOfflineBundle(
         context = context,
         target = CachedGameRefreshTarget(
@@ -624,10 +886,10 @@ internal suspend fun cacheGame(
         creds = creds,
         userAgent = userAgent,
         db = db,
-        notificationMode = RefreshNotificationMode.Foreground,
+        notificationMode = notificationMode,
         cacheImages = cacheImages,
+        awaitImages = awaitImages,
     )
-}
 
 
 internal suspend fun cacheUnlocks(
@@ -757,8 +1019,9 @@ private fun pendingAwardUser(award: PendingAward): String? {
 
 internal fun httpGet(url: String, userAgent: String): HttpGetResult {
     val action = apiActionFromUrl(url)
+    val maxRetries = if (RateLimitBackoff.inBackground) 0 else HTTP_GET_MAX_429_RETRIES
 
-    repeat(HTTP_GET_MAX_429_RETRIES + 1) { attempt ->
+    repeat(maxRetries + 1) { attempt ->
         if (action != null) {
             throttleRetroAchievementsApiRequest("GET $action")
         }
@@ -770,8 +1033,12 @@ internal fun httpGet(url: String, userAgent: String): HttpGetResult {
             setRequestProperty("Accept-Encoding", "identity")
         }
 
+        val source = if (RateLimitBackoff.inBackground) RaRequestSource.Background else RaRequestSource.App
+        var responded = false
         try {
             val statusCode = connection.responseCode
+            responded = true
+            if (action != null) UsageStats.recordRaRequest(source, statusCode)
             val reason = connection.responseMessage
             val body = (if (statusCode in 200..299) connection.inputStream else connection.errorStream)
                 ?.bufferedReader()
@@ -782,7 +1049,10 @@ internal fun httpGet(url: String, userAgent: String): HttpGetResult {
                 return HttpGetResult.Success(body)
             }
 
-            if (statusCode == HTTP_TOO_MANY_REQUESTS && attempt < HTTP_GET_MAX_429_RETRIES) {
+            if (statusCode == HTTP_TOO_MANY_REQUESTS) {
+                RateLimitBackoff.onRateLimited(retryAfterHeaderMillis(connection))
+            }
+            if (statusCode == HTTP_TOO_MANY_REQUESTS && attempt < maxRetries) {
                 val retryAfterMillis = retryAfterMillis(connection, attempt)
                 Log.w(TAG, "httpGet hit 429 for ${action ?: redactTokens(url)}; retrying in ${retryAfterMillis}ms (attempt ${attempt + 1}/$HTTP_GET_MAX_429_RETRIES)")
                 Thread.sleep(retryAfterMillis)
@@ -795,6 +1065,7 @@ internal fun httpGet(url: String, userAgent: String): HttpGetResult {
                 )
             }
         } catch (e: IOException) {
+            if (action != null && !responded) UsageStats.recordRaRequest(source, statusCode = null)
             return HttpGetResult.Failure(
                 kind = "network",
                 exceptionMessage = e.message ?: e::class.java.simpleName
@@ -814,10 +1085,12 @@ internal fun httpGet(url: String, userAgent: String): HttpGetResult {
 private fun apiActionFromUrl(url: String): String? =
     url.substringAfter("r=", "").substringBefore('&').takeIf { it.isNotEmpty() }
 
+private fun retryAfterHeaderMillis(connection: HttpURLConnection): Long? =
+    connection.getHeaderField(HTTP_RETRY_AFTER_HEADER)?.trim()?.toLongOrNull()?.times(1000)?.takeIf { it > 0 }
+
 private fun retryAfterMillis(connection: HttpURLConnection, attempt: Int): Long {
-    val headerValue = connection.getHeaderField(HTTP_RETRY_AFTER_HEADER)?.trim()
-    val headerMillis = headerValue?.toLongOrNull()?.times(1000)
-    if (headerMillis != null && headerMillis > 0) {
+    val headerMillis = retryAfterHeaderMillis(connection)
+    if (headerMillis != null) {
         return min(headerMillis, HTTP_GET_MAX_429_BACKOFF_MS)
     }
 

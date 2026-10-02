@@ -1,6 +1,7 @@
 package com.raofflineproxy
 
 import com.raofflineproxy.data.CacheKeys
+import com.raofflineproxy.proxy.proxyCacheKey
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -45,6 +46,12 @@ class CacheKeysTest {
     @Test
     fun login_buildsKeyWithUsername() {
         assertEquals("login2::player1", CacheKeys.login("player1"))
+    }
+
+    @Test
+    fun login_lowercasesUsernameToMatchProxyCacheKey() {
+        assertEquals("login2::carter84", CacheKeys.login("Carter84"))
+        assertEquals(proxyCacheKey("/dorequest.php?r=login2&u=Carter84", ""), CacheKeys.login("Carter84"))
     }
 
     @Test
@@ -194,6 +201,39 @@ class CacheKeysTest {
     @Test
     fun parseUserFromAchievementSetsKey_validKey() {
         assertEquals("player", CacheKeys.parseUserFromAchievementSetsKey("achievementsets:abc123hash:player"))
+    }
+
+    @Test
+    fun unlocksPrefix_matchesOnlyThatGame() {
+        assertTrue(CacheKeys.unlocks(12, "Player").startsWith(CacheKeys.unlocksPrefix("12")))
+        assertTrue(!CacheKeys.unlocks(123, "Player").startsWith(CacheKeys.unlocksPrefix("12")))
+    }
+
+    @Test
+    fun startSessionPrefix_matchesOnlyThatGame() {
+        assertTrue(CacheKeys.startSession(12, "Player").startsWith(CacheKeys.startSessionPrefix("12")))
+        assertTrue(!CacheKeys.startSession(123, "Player").startsWith(CacheKeys.startSessionPrefix("12")))
+    }
+
+    @Test
+    fun prefixLastPlayed_constant() {
+        assertEquals("lastplayed:", CacheKeys.PREFIX_LAST_PLAYED)
+    }
+
+    @Test
+    fun lastPlayed_buildsKey() {
+        assertEquals("lastplayed:1234", CacheKeys.lastPlayed(1234))
+    }
+
+    @Test
+    fun parseGameIdFromLastPlayedKey_validKey() {
+        assertEquals(1234, CacheKeys.parseGameIdFromLastPlayedKey("lastplayed:1234"))
+    }
+
+    @Test
+    fun parseGameIdFromLastPlayedKey_rejectsNonNumericKey() {
+        assertNull(CacheKeys.parseGameIdFromLastPlayedKey("lastplayed:"))
+        assertNull(CacheKeys.parseGameIdFromLastPlayedKey("lastplayed:abc"))
     }
 
     @Test

@@ -5,16 +5,17 @@
     "workspaces": [
         "raop-log-upload",
         "raop-support-report",
-        "raop-support-payment"
+        "raop-support-payment",
+        "raop-usage-ping"
     ],
     "scripts": {
         "build": "node build.mjs",
         "typecheck": "npm run typecheck --workspaces"
     },
     "devDependencies": {
-        "@aws-sdk/client-s3": "^3.1131.0",
-        "@aws-sdk/s3-request-presigner": "^3.1131.0",
-        "@types/node": "^26.5.1",
+        "@aws-sdk/client-s3": "^3.1141.0",
+        "@aws-sdk/s3-request-presigner": "^3.1141.0",
+        "@types/node": "^26.6.2",
         "archiver": "^8.0.0",
         "esbuild": "^0.28.2",
         "typescript": "7.0.2"

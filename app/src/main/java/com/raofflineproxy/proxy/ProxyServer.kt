@@ -14,6 +14,8 @@ import com.raofflineproxy.sha256Hex
 import com.raofflineproxy.sharedHttpClient
 import com.raofflineproxy.throttleRetroAchievementsApiRequest
 import com.raofflineproxy.data.AppDatabase
+import com.raofflineproxy.usage.RaRequestSource
+import com.raofflineproxy.usage.executeCounted
 import com.raofflineproxy.data.CacheEntry
 import com.raofflineproxy.data.CacheKeys
 import com.raofflineproxy.data.PendingAward
@@ -66,6 +68,7 @@ private val AWARD_ACTIONS = setOf("awardachievement", "submitlbentry")
 
 // Offline: return a canned success response instead of hitting the server
 private val FAKE_OFFLINE_SUCCESS_ACTIONS = setOf("ping", "postactivity")
+private val LAST_PLAYED_ACTIONS = setOf("ping", "startsession")
 
 // These requests are safe to cache and serve offline
 private val CACHEABLE_ACTIONS = setOf("patch", "achievementsets", "gameid", "achievements", "hashlibrary", "login2", "unlocks")
@@ -323,7 +326,12 @@ class ProxyServer(
             Log.i(TAG, "Request: $method ${redactTokens(path)} body=${redactFormBody(rawBody)} action=$action online=${isOnline()}")
         }
         extractGameActivity(path, rawBody, action)?.let { activity ->
-            activity.gameId.toIntOrNull()?.let { activeGameId = it }
+            activity.gameId.toIntOrNull()?.let { gameId ->
+                activeGameId = gameId
+                if (action in LAST_PLAYED_ACTIONS) {
+                    scope.launch(Dispatchers.IO) { recordGamePlayed(db, gameId) }
+                }
+            }
             onGameActivity(activity)
         }
 
@@ -548,7 +556,7 @@ class ProxyServer(
             if (method == "POST") Log.d(TAG, "→ RA POST body: ${redactFormBody(rawBody)}")
 
             throttleRetroAchievementsApiRequest("$method ${action.lowercase()}")
-            sharedHttpClient.newCall(request).execute().use { resp ->
+            sharedHttpClient.newCall(request).executeCounted(RaRequestSource.Emulator).use { resp ->
                 val body = resp.body.string()
                 Log.d(TAG, "← RA ${resp.code} for ${redactTokens(path)} (${body.length} bytes)")
                 if (action == "awardachievement") {
