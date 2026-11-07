@@ -4,10 +4,14 @@ import pytest
 
 from app.e2e.harness.session import (
     APP_PACKAGE,
+    CLIENT_PACKAGE,
+    CONTROL_PERMISSION,
     PROXY_BASE,
     PROXY_VALUE,
     START_LABEL,
     STOP_LABEL,
+    TOKEN,
+    USER,
     wait_until,
 )
 
@@ -15,6 +19,9 @@ HARDCORE_KEY = "cheevos_hardcore_mode_enable"
 CUSTOM_HOST_KEY = "cheevos_custom_host"
 AUTOSTART_PREF = "autostart_proxy"
 BACKGROUND_FGS_RESTRICTED_SDK = 31
+STATUS_VERSION = 2
+MSLUG_HASH = "b43c8b4ec999588c04dad79bb8bcc745"
+MSLUG_GAME_ID = 1447
 
 
 @pytest.fixture
@@ -31,10 +38,11 @@ class TestStatus:
     def test_reports_a_stopped_proxy_with_an_empty_queue(self, android):
         status = android.status()
 
-        assert status["version"] == 1
+        assert status["version"] == STATUS_VERSION
         assert status["running"] is False
         assert status["shouldBeRunning"] is False
         assert status["queue"] == {"count": 0, "state": "idle", "nextWindowAt": None}
+        assert status["pendingAwards"] == {"count": 0, "state": "idle", "error": None}
 
     def test_reports_a_running_proxy_online(self, android):
         android.start_proxy()
@@ -47,9 +55,67 @@ class TestStatus:
         assert status["online"] is True
 
 
+@pytest.fixture
+def offline_award(android):
+    """One award queued while RetroAchievements is unreachable."""
+    android.start_proxy()
+    android.wait_until_online()
+    android.emulator.boot_sequence(USER, TOKEN, MSLUG_HASH)
+    android.go_offline()
+    status, payload = android.emulator.award(USER, TOKEN, 22002)
+    assert status == 200 and payload.get("Error") == "queued_offline"
+    return android
+
+
+def pending_awards(android) -> dict:
+    return android.status()["pendingAwards"]
+
+
+def pending_awards_in_state(android, state: str):
+    awards = pending_awards(android)
+    return awards if awards["state"] == state else None
+
+
+class TestPendingAwards:
+    def test_waits_while_offline(self, offline_award):
+        assert wait_until(
+            lambda: pending_awards(offline_award) == {"count": 1, "state": "waiting", "error": None},
+            30,
+            message="pending award reported as waiting",
+        )
+
+    def test_uploads_and_turns_idle_once_online(self, offline_award):
+        offline_award.go_online()
+
+        assert wait_until(
+            lambda: pending_awards(offline_award) == {"count": 0, "state": "idle", "error": None},
+            180,
+            message="pending award uploaded",
+        )
+        assert 22002 in offline_award.ra.unlocks(USER, MSLUG_GAME_ID)
+
+    def test_is_blocked_while_the_proxy_is_stopped(self, offline_award):
+        offline_award.stop_proxy()
+
+        assert pending_awards(offline_award) == {"count": 1, "state": "blocked", "error": None}
+
+    def test_is_blocked_with_a_reason_when_the_upload_fails(self, offline_award):
+        offline_award.ra.state.rotate_token(USER)
+
+        offline_award.go_online()
+
+        blocked = wait_until(
+            lambda: pending_awards_in_state(offline_award, "blocked"),
+            180,
+            message="failed upload reported as blocked",
+        )
+        assert blocked["count"] == 1
+        assert blocked["error"] == "auth"
+
+
 class TestPermission:
     def test_shell_can_read_status(self, android):
-        assert '"version":1' in android.shell_control("status")
+        assert '"version":%d' % STATUS_VERSION in android.shell_control("status")
 
     @pytest.mark.parametrize("method", ["start", "stop"])
     def test_shell_cannot_start_or_stop(self, android, method):
@@ -57,6 +123,14 @@ class TestPermission:
 
         assert "SecurityException" in output
         assert not android.proxy_service_running()
+
+    def test_a_client_installed_first_works_once_the_user_allows_it(self, android):
+        android.device.revoke(CLIENT_PACKAGE, CONTROL_PERMISSION)
+        assert "SecurityException" in android.control_output("stop")
+
+        android.device.grant(CLIENT_PACKAGE, CONTROL_PERMISSION)
+
+        assert android.control("stop")[0] == "ok"
 
 
 class TestStart:

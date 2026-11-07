@@ -14,7 +14,6 @@ import androidx.core.content.edit
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.raofflineproxy.BuildConfig
-import com.raofflineproxy.applyScanBatchCooldown
 import com.raofflineproxy.buildApiUrl
 import com.raofflineproxy.PrefsConstants
 import com.raofflineproxy.R
@@ -32,6 +31,7 @@ import com.raofflineproxy.data.AppDatabase
 import com.raofflineproxy.data.CacheEntry
 import com.raofflineproxy.data.CacheEntrySummary
 import com.raofflineproxy.data.CacheKeys
+import com.raofflineproxy.data.forEachEntryByPrefix
 import com.raofflineproxy.data.CachedGame
 import com.raofflineproxy.data.PendingAward
 import com.raofflineproxy.data.PendingAwardUi
@@ -47,7 +47,8 @@ import com.raofflineproxy.service.text
 import com.raofflineproxy.proxy.CACHE_BUDGET_LIMIT
 import com.raofflineproxy.proxy.CacheQueue
 import com.raofflineproxy.proxy.QueueEstimate
-import com.raofflineproxy.proxy.estimateQueueForDocuments
+import com.raofflineproxy.proxy.WatchFolders
+import com.raofflineproxy.proxy.WatchedFolder
 import com.raofflineproxy.proxy.SmartCacheRunResult
 import com.raofflineproxy.proxy.ScanResult
 import com.raofflineproxy.proxy.drainCacheQueue
@@ -57,7 +58,6 @@ import com.raofflineproxy.proxy.PasswordCredentials
 import com.raofflineproxy.proxy.patchImagePath
 import com.raofflineproxy.proxy.patchImageUrl
 import com.raofflineproxy.proxy.resolveCachedStaticAsset
-import com.raofflineproxy.proxy.cachedBadgeFileNames
 import com.raofflineproxy.proxy.cachedBadgePath
 import com.raofflineproxy.proxy.cacheLoginCredentialsResponse
 import com.raofflineproxy.proxy.clearAllCachedImages
@@ -68,9 +68,6 @@ import com.raofflineproxy.proxy.httpGet
 import com.raofflineproxy.proxy.loginAndCacheToken
 import com.raofflineproxy.proxy.loadLoginCredentials
 import com.raofflineproxy.proxy.deleteCachedGamesData
-import com.raofflineproxy.proxy.loadCachedGameRefreshTargets
-import com.raofflineproxy.proxy.refreshCachedGameOfflineBundle
-import com.raofflineproxy.proxy.RefreshNotificationMode
 import com.raofflineproxy.proxy.runSmartCache
 import com.raofflineproxy.proxy.loadUserAgent
 import com.raofflineproxy.proxy.compactCachedRawResponse
@@ -103,12 +100,15 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
+import java.io.File
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.time.Duration.Companion.milliseconds
@@ -124,6 +124,7 @@ sealed interface MainUiEvent {
     data object PromptSmartCacheAfterProxyStart : MainUiEvent
     data object PromptManualCredentials : MainUiEvent
     data object PromptCredentialsForCaching : MainUiEvent
+    data object PromptLoginChoice : MainUiEvent
     data object OpenShizukuGuide : MainUiEvent
     data class ShowAppUpdate(val update: AppUpdateInfo) : MainUiEvent
     data object RequestShizukuPermission : MainUiEvent
@@ -135,9 +136,9 @@ sealed interface MainUiEvent {
 
 private sealed interface PendingCredentialAction {
     data object SmartCache : PendingCredentialAction
-    data object RefreshGames : PendingCredentialAction
-    data class AddRom(val uris: List<Uri>) : PendingCredentialAction
     data class ScanRoms(val treeUri: Uri) : PendingCredentialAction
+    data class StartProxy(val treeUri: Uri?) : PendingCredentialAction
+    data class FinishProxyStart(val alreadyRunning: Boolean) : PendingCredentialAction
 }
 
 data class MainUiState(
@@ -178,7 +179,7 @@ data class MainUiState(
     val flushInProgress: Boolean = false,
     val availableAppUpdate: AppUpdateInfo? = null
 ) {
-    val hasEnabledEmulator: Boolean = emulators.hasAnyEnabled
+    val canStartWithoutEmulator: Boolean = emulators.canStartProxy
     val hasShizukuManagedEnabledEmulator: Boolean = emulators.hasAnyShizukuManagedEnabled
 
     fun clearedPermissions(): MainUiState = copy(
@@ -197,6 +198,13 @@ data class MainUiState(
 class MainViewModel(app: Application) : AndroidViewModel(app) {
     private companion object {
         const val APP_UPDATE_CHECK_INTERVAL_MS = 24L * 60L * 60L * 1000L
+
+        // Activities are recreated on every return from Home, so this must outlive the ViewModel.
+        @Volatile
+        var lastPromptedRejectedToken: String? = null
+
+        @Volatile
+        var loginChoiceSkipped = false
     }
 
     private val application = app
@@ -207,9 +215,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     val events = _events.asSharedFlow()
     private val _cachedGames = MutableStateFlow<List<CachedGame>>(emptyList())
     val cachedGames: StateFlow<List<CachedGame>> = _cachedGames.asStateFlow()
+    val watchedFolders: StateFlow<List<WatchedFolder>> =
+        WatchFolders.observe(db).stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
     private val pendingDeletedGameIds: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val patchCache = mutableMapOf<Long, ParsedPatch>()
     private val unlockCache = mutableMapOf<Long, CachedUnlocks>()
+    private val awardAchievementCache = mutableMapOf<Int, CachedAwardAchievement>()
     private val connectivityManager =
         app.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     private var pendingProxyStart = false
@@ -223,8 +234,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private var pendingSmartCacheGrantTargets = emptyList<SafGrantTarget>()
     private var pendingPpssppShizukuRootModePrompt = false
     private var smartCacheAllFilesRejectedThisRun = false
-    private var pendingAddRomUris = emptyList<Uri>()
     private var pendingCredentialAction: PendingCredentialAction? = null
+    private var credentialsPromptActive = false
     private var lastTokenValidationAttemptAt: Long = 0L
     private var queueConfirmation: CompletableDeferred<Boolean>? = null
     private fun str(resId: Int): String = getApplication<Application>().getString(resId)
@@ -344,9 +355,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     .map { it.isNotEmpty() }
                     .distinctUntilChanged()
             ) { awards, historyAwards, patchSummaries, unlockSummaries, hasLoginCredentials ->
-                val badgeNames = cachedBadgeFileNames(application)
-                val patches = loadPatchViews(patchSummaries, badgeNames)
-                val achievementIndex = buildAchievementIndex(patches)
+                val patches = loadPatchViews(patchSummaries)
+                val achievementIndex = buildAchievementIndex(
+                    patches,
+                    (awards + historyAwards).mapNotNullTo(HashSet()) { parsePendingAwardAchievementId(it) }
+                )
                 val resolvedAwards = awards.map { resolvePendingAward(it, achievementIndex) }
                 val resolvedHistoryAwards = historyAwards.map { resolvePendingAward(it, achievementIndex) }
                 val pendingAwardsByGameId = buildPendingAwardsByGameId(achievementIndex, awards)
@@ -437,9 +450,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val anyPatched = retroArchPatched || dolphinPatched || ppssppPatched || anyBroadcastPatched
             val proxyRunning = ProxyService.isRunning(app)
             val prefs = app.getSharedPreferences(PrefsConstants.PREFS_NAME, Context.MODE_PRIVATE)
-            val retroArchPatchedThisRun = prefs.getBoolean(PrefsConstants.KEY_RETROARCH_PATCHED_THIS_RUN, false)
-            val dolphinPatchedThisRun = prefs.getBoolean(PrefsConstants.KEY_DOLPHIN_PATCHED_THIS_RUN, false)
-            val ppssppPatchedThisRun = prefs.getBoolean(PrefsConstants.KEY_PPSSPP_PATCHED_THIS_RUN, false)
+            val retroArchPatchedThisRun = prefs.isPatchedThisRun(Emulator.RetroArch)
+            val dolphinPatchedThisRun = prefs.isPatchedThisRun(Emulator.Dolphin)
+            val ppssppPatchedThisRun = prefs.isPatchedThisRun(Emulator.Ppsspp)
 
             if (!proxyRunning && shouldKeepRunning) {
                 ProxyService.start(app)
@@ -462,7 +475,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             val retroArchResult = if (retroArchPatchedThisRun || retroArchPatched) {
-                val restoreHardcore = prefs.getBoolean(PrefsConstants.KEY_RETROARCH_HARDCORE_WAS_ENABLED, false)
+                val restoreHardcore = prefs.hardcoreWasEnabled(Emulator.RetroArch)
                 withContext(Dispatchers.IO) {
                     revertRetroArchCfg(app, retroArchTreeUri, restoreHardcore)
                 }
@@ -472,7 +485,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val retroArchRevertedTarget = retroArchResult.success && retroArchResult.copyBackPath == null
 
             val dolphinResult = if (dolphinPatchedThisRun || dolphinPatched) {
-                val restoreDolphinHardcore = prefs.getBoolean(PrefsConstants.KEY_DOLPHIN_HARDCORE_WAS_ENABLED, false)
+                val restoreDolphinHardcore = prefs.hardcoreWasEnabled(Emulator.Dolphin)
                 withContext(Dispatchers.IO) {
                     revertDolphinCfg(app, dolphinTreeUri, restoreDolphinHardcore)
                 }
@@ -482,7 +495,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val dolphinRevertedTarget = dolphinResult.success && dolphinResult.copyBackPath == null
 
             val ppssppResult = if (ppssppPatchedThisRun || ppssppPatched) {
-                val restorePpssppHardcore = prefs.getBoolean(PrefsConstants.KEY_PPSSPP_HARDCORE_WAS_ENABLED, false)
+                val restorePpssppHardcore = prefs.hardcoreWasEnabled(Emulator.Ppsspp)
                 withContext(Dispatchers.IO) {
                     revertPpssppCfg(app, ppssppTreeUri, restorePpssppHardcore)
                 }
@@ -495,24 +508,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val failedBroadcastRevert = broadcastResults.values.firstOrNull { !it.success }
 
             if (retroArchRevertedTarget) {
-                prefs.edit {
-                    remove(PrefsConstants.KEY_RETROARCH_HARDCORE_WAS_ENABLED)
-                    remove(PrefsConstants.KEY_RETROARCH_PATCHED_THIS_RUN)
-                }
+                prefs.clearPatchState(Emulator.RetroArch)
             }
 
             if (dolphinRevertedTarget) {
-                prefs.edit {
-                    remove(PrefsConstants.KEY_DOLPHIN_HARDCORE_WAS_ENABLED)
-                    remove(PrefsConstants.KEY_DOLPHIN_PATCHED_THIS_RUN)
-                }
+                prefs.clearPatchState(Emulator.Dolphin)
             }
 
             if (ppssppRevertedTarget) {
-                prefs.edit {
-                    remove(PrefsConstants.KEY_PPSSPP_HARDCORE_WAS_ENABLED)
-                    remove(PrefsConstants.KEY_PPSSPP_PATCHED_THIS_RUN)
-                }
+                prefs.clearPatchState(Emulator.Ppsspp)
             }
 
             val needsSafGrant = retroArchResult.needsSafGrant || dolphinResult.needsSafGrant || ppssppResult.needsSafGrant
@@ -560,7 +564,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val credentials = withContext(Dispatchers.IO) { loadLoginCredentials(db) }
         if (credentials == null) {
             pendingCredentialAction = pendingAction
-            _events.tryEmit(MainUiEvent.PromptCredentialsForCaching)
+            promptForCredentials()
         }
         return credentials
     }
@@ -686,12 +690,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             needsSafGrant = remaining.isNotEmpty(),
             safGrantTarget = remaining.firstOrNull()
         )
-        if (pendingAddRomUris.isNotEmpty() && remaining.isEmpty()) {
-            val uris = pendingAddRomUris
-            pendingAddRomUris = emptyList()
-            addRom(uris)
-            return
-        }
         if (pendingSmartCacheStart && remaining.isEmpty()) {
             pendingSmartCacheGrantTargets = emptyList()
             pendingSmartCacheStart = false
@@ -780,7 +778,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         SnackbarManager.showMessage(str(R.string.smart_cache_requires_ppsspp_access), SnackbarDuration.Indefinite)
                     }
                     SafGrantTarget.AllFilesAccess -> {
-                        pendingAddRomUris = emptyList()
                         SnackbarManager.showMessage(str(R.string.smart_cache_requires_all_files_access), SnackbarDuration.Indefinite)
                     }
                     SafGrantTarget.SmartCacheRom -> {
@@ -843,7 +840,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 SnackbarManager.showMessage(str(R.string.proxy_start_aborted_ppsspp_saf_rejected), SnackbarDuration.Indefinite)
             }
             SafGrantTarget.AllFilesAccess -> {
-                pendingAddRomUris = emptyList()
                 pendingSmartCacheGrantTargets = emptyList()
                 pendingSmartCacheRomGrantPaths = emptyList()
                 SnackbarManager.showMessage(str(R.string.smart_cache_requires_all_files_access), SnackbarDuration.Indefinite)
@@ -890,6 +886,58 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    private fun promptForCredentials() {
+        credentialsPromptActive = true
+        _events.tryEmit(MainUiEvent.PromptCredentialsForCaching)
+    }
+
+    fun cancelCredentialsPrompt() {
+        credentialsPromptActive = false
+        val action = pendingCredentialAction
+        pendingCredentialAction = null
+        if (action is PendingCredentialAction.FinishProxyStart) {
+            stopProxy()
+        }
+    }
+
+    private fun promptLoginChoice() {
+        _events.tryEmit(MainUiEvent.PromptLoginChoice)
+    }
+
+    fun chooseLogin() {
+        promptForCredentials()
+    }
+
+    fun chooseStartWithoutLogin() {
+        loginChoiceSkipped = true
+        val action = pendingCredentialAction
+        pendingCredentialAction = null
+        when (action) {
+            is PendingCredentialAction.StartProxy -> startProxy(action.treeUri)
+            is PendingCredentialAction.FinishProxyStart -> finishAutoPatchedProxyStart(action.alreadyRunning)
+            else -> Unit
+        }
+    }
+
+    private fun finishAutoPatchedProxyStart(alreadyRunning: Boolean) {
+        val app = getApplication<Application>()
+        ProxyService.start(app)
+        pendingProxyStart = false
+        _state.value = _state.value.copy(
+            proxyRunning = true,
+            cfgIsPatched = true,
+            needsSafGrant = false,
+            safGrantTarget = null,
+            pendingSafGrantTargets = emptyList(),
+            authState = AuthState.Unknown
+        )
+        if (!alreadyRunning) {
+            SnackbarManager.showMessage(str(R.string.proxy_started_success))
+        }
+        maybeShowSmartCachePrompt()
+        validateToken()
+    }
+
     fun validateToken(force: Boolean = true) {
         viewModelScope.launch {
             val credentials = withContext(Dispatchers.IO) { loadLoginCredentials(db) }
@@ -918,6 +966,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 return@launch
             }
             lastTokenValidationAttemptAt = now
+            var rejected = false
             val valid = withContext(Dispatchers.IO) {
                 val userAgent = proxyUserAgent(loadUserAgent(db))
                 val url = buildApiUrl(
@@ -931,9 +980,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 )
                 when (val result = httpGet(url, userAgent)) {
                     is HttpGetResult.Success -> JSONObject(result.body).optBoolean("Success", false)
+                        .also { rejected = !it && isInvalidCredentialsResponse(result.body) }
                     is HttpGetResult.Failure -> {
                         val logDetails = result.logMessage("patch", url)
-                        RequestFailureNotifier.report(result.userMessage(getApplication(), "patch"), logDetails)
+                        rejected = result.isAuthRejection
+                        if (shouldReportAuthFailure(rejected, credentials.token, lastPromptedRejectedToken)) {
+                            RequestFailureNotifier.report(result.userMessage(getApplication(), "patch"), logDetails)
+                        }
                         Log.w("RAProxy/Auth", "validateToken: live check failed — $logDetails")
                         false
                     }
@@ -941,6 +994,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
             Log.i("RAProxy/Auth", "validateToken: live patch check valid=$valid")
             _state.value = _state.value.copy(authState = if (valid) AuthState.Valid else AuthState.Invalid)
+            if (shouldPromptRejectedToken(rejected, credentialsPromptActive, credentials.token, lastPromptedRejectedToken)) {
+                lastPromptedRejectedToken = credentials.token
+                promptForCredentials()
+            }
         }
     }
     fun startProxy(treeUri: Uri? = null) {
@@ -972,7 +1029,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 val emulatorSupport = loadEmulatorSupport(app)
                 prefs.edit { remove(PrefsConstants.KEY_SKIP_NEXT_CFG_REVERT) }
 
-                if (!emulatorSupport.hasAnyEnabled) {
+                if (!emulatorSupport.canStartProxy) {
                     pendingProxyStart = false
                     SnackbarManager.showError(str(R.string.proxy_start_requires_emulator))
                     return@launch
@@ -1045,6 +1102,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     return@launch
                 }
 
+                val hasCachedCredentials = withContext(Dispatchers.IO) { loadLoginCredentials(db) } != null
+                if (needsLoginChoice(hasCachedCredentials, emulatorSupport, loginChoiceSkipped)) {
+                    pendingProxyStart = false
+                    pendingCredentialAction = PendingCredentialAction.StartProxy(treeUri)
+                    promptLoginChoice()
+                    return@launch
+                }
+
                 val retroArchTreeUri = treeUri ?: loadSafUri()
                 val dolphinTreeUri = loadDolphinSafUri()
                 val ppssppTreeUri = loadPpssppSafUri()
@@ -1079,12 +1144,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         SnackbarManager.showError(result.message)
                         return@launch
                     }
-                    prefs.edit {
-                        putBoolean(PrefsConstants.KEY_RETROARCH_HARDCORE_WAS_ENABLED, result.hardcoreWasEnabled)
-                        putBoolean(PrefsConstants.KEY_RETROARCH_PATCHED_THIS_RUN, true)
-                    }
+                    prefs.recordPatched(Emulator.RetroArch, result.hardcoreWasEnabled)
                 } else {
-                    prefs.edit { remove(PrefsConstants.KEY_RETROARCH_PATCHED_THIS_RUN) }
+                    prefs.edit { remove(Emulator.RetroArch.patchedThisRunPrefsKey) }
                 }
 
                 val dolphinStoredCredentials = if (emulatorSupport.isEnabled(Emulator.Dolphin)) {
@@ -1118,13 +1180,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         pendingProxyStart = false
                         return@launch
                     } else if (dolphinResult.success && !dolphinResult.skippedNotInstalled) {
-                        prefs.edit {
-                            putBoolean(PrefsConstants.KEY_DOLPHIN_HARDCORE_WAS_ENABLED, dolphinResult.hardcoreWasEnabled)
-                            putBoolean(PrefsConstants.KEY_DOLPHIN_PATCHED_THIS_RUN, true)
-                        }
+                        prefs.recordPatched(Emulator.Dolphin, dolphinResult.hardcoreWasEnabled)
                     }
                 } else {
-                    prefs.edit { remove(PrefsConstants.KEY_DOLPHIN_PATCHED_THIS_RUN) }
+                    prefs.edit { remove(Emulator.Dolphin.patchedThisRunPrefsKey) }
                 }
 
                 val ppssppResult = if (emulatorSupport.isEnabled(Emulator.Ppsspp)) {
@@ -1153,13 +1212,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         pendingProxyStart = false
                         return@launch
                     } else if (ppssppResult.success && !ppssppResult.skippedNotInstalled) {
-                        prefs.edit {
-                            putBoolean(PrefsConstants.KEY_PPSSPP_HARDCORE_WAS_ENABLED, ppssppResult.hardcoreWasEnabled)
-                            putBoolean(PrefsConstants.KEY_PPSSPP_PATCHED_THIS_RUN, true)
-                        }
+                        prefs.recordPatched(Emulator.Ppsspp, ppssppResult.hardcoreWasEnabled)
                     }
                 } else {
-                    prefs.edit { remove(PrefsConstants.KEY_PPSSPP_PATCHED_THIS_RUN) }
+                    prefs.edit { remove(Emulator.Ppsspp.patchedThisRunPrefsKey) }
                 }
 
                 patchBroadcastEmulators(app, prefs, emulatorSupport)?.let { failure ->
@@ -1177,21 +1233,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     withContext(Dispatchers.IO) { cacheImportedCredentials(credentials) }
                 }
 
-                ProxyService.start(app)
-                pendingProxyStart = false
-                _state.value = _state.value.copy(
-                    proxyRunning = true,
-                    cfgIsPatched = true,
-                    needsSafGrant = false,
-                    safGrantTarget = null,
-                    pendingSafGrantTargets = emptyList(),
-                    authState = AuthState.Unknown
-                )
-                if (!alreadyRunning) {
-                    SnackbarManager.showMessage(str(R.string.proxy_started_success))
+                val hasCredentialsAfterImport = withContext(Dispatchers.IO) { loadLoginCredentials(db) } != null
+                if (needsLoginChoiceAfterImport(hasCredentialsAfterImport, loginChoiceSkipped)) {
+                    pendingProxyStart = false
+                    pendingCredentialAction = PendingCredentialAction.FinishProxyStart(alreadyRunning)
+                    promptLoginChoice()
+                    return@launch
                 }
-                maybeShowSmartCachePrompt()
-                validateToken()
+
+                finishAutoPatchedProxyStart(alreadyRunning)
             } finally {
                 delay(250.milliseconds)
                 _state.value = _state.value.copy(proxyToggleInProgress = false)
@@ -1269,18 +1319,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 val retroArchTreeUri = treeUri ?: loadSafUri()
                 val dolphinTreeUri = loadDolphinSafUri()
                 val ppssppTreeUri = loadPpssppSafUri()
-                val retroArchPatchedThisRun = prefs.getBoolean(PrefsConstants.KEY_RETROARCH_PATCHED_THIS_RUN, false)
+                val retroArchPatchedThisRun = prefs.isPatchedThisRun(Emulator.RetroArch)
                 val result = if (retroArchPatchedThisRun) {
-                    val restoreHardcore = prefs.getBoolean(PrefsConstants.KEY_RETROARCH_HARDCORE_WAS_ENABLED, false)
+                    val restoreHardcore = prefs.hardcoreWasEnabled(Emulator.RetroArch)
                     withContext(Dispatchers.IO) { revertRetroArchCfg(app, retroArchTreeUri, restoreHardcore) }
                 } else {
                     ConfigPatchResult(success = true, message = "RetroArch not patched this run.")
                 }
                 val revertedTarget = result.success && result.copyBackPath == null
 
-                val dolphinPatchedThisRun = prefs.getBoolean(PrefsConstants.KEY_DOLPHIN_PATCHED_THIS_RUN, false)
+                val dolphinPatchedThisRun = prefs.isPatchedThisRun(Emulator.Dolphin)
                 val dolphinResult = if (dolphinPatchedThisRun) {
-                    val restoreDolphinHardcore = prefs.getBoolean(PrefsConstants.KEY_DOLPHIN_HARDCORE_WAS_ENABLED, false)
+                    val restoreDolphinHardcore = prefs.hardcoreWasEnabled(Emulator.Dolphin)
                     withContext(Dispatchers.IO) {
                         revertDolphinCfg(app, dolphinTreeUri, restoreDolphinHardcore)
                     }
@@ -1288,9 +1338,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     ConfigPatchResult(success = true, message = "Dolphin not patched this run.", skippedNotInstalled = true)
                 }
 
-                val ppssppPatchedThisRun = prefs.getBoolean(PrefsConstants.KEY_PPSSPP_PATCHED_THIS_RUN, false)
+                val ppssppPatchedThisRun = prefs.isPatchedThisRun(Emulator.Ppsspp)
                 val ppssppResult = if (ppssppPatchedThisRun) {
-                    val restorePpssppHardcore = prefs.getBoolean(PrefsConstants.KEY_PPSSPP_HARDCORE_WAS_ENABLED, false)
+                    val restorePpssppHardcore = prefs.hardcoreWasEnabled(Emulator.Ppsspp)
                     withContext(Dispatchers.IO) {
                         revertPpssppCfg(app, ppssppTreeUri, restorePpssppHardcore)
                     }
@@ -1303,22 +1353,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
                 if (revertedTarget) {
                     prefs.edit {
-                        remove(PrefsConstants.KEY_RETROARCH_HARDCORE_WAS_ENABLED)
-                        remove(PrefsConstants.KEY_RETROARCH_PATCHED_THIS_RUN)
+                        remove(Emulator.RetroArch.hardcoreWasEnabledPrefsKey)
+                        remove(Emulator.RetroArch.patchedThisRunPrefsKey)
                         putBoolean(PrefsConstants.KEY_SKIP_NEXT_CFG_REVERT, true)
                     }
                 }
                 if (dolphinResult.success && dolphinResult.copyBackPath == null) {
-                    prefs.edit {
-                        remove(PrefsConstants.KEY_DOLPHIN_HARDCORE_WAS_ENABLED)
-                        remove(PrefsConstants.KEY_DOLPHIN_PATCHED_THIS_RUN)
-                    }
+                    prefs.clearPatchState(Emulator.Dolphin)
                 }
                 if (ppssppResult.success && ppssppResult.copyBackPath == null) {
-                    prefs.edit {
-                        remove(PrefsConstants.KEY_PPSSPP_HARDCORE_WAS_ENABLED)
-                        remove(PrefsConstants.KEY_PPSSPP_PATCHED_THIS_RUN)
-                    }
+                    prefs.clearPatchState(Emulator.Ppsspp)
                 }
                 ProxyService.stop(app)
 
@@ -1510,59 +1554,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         return if (queued > 0) "$summary ${str(R.string.caching_queue_hint, CACHE_BUDGET_LIMIT)}" else summary
     }
 
-    fun addRom(fileUris: List<Uri>) {
-        val app = getApplication<Application>()
-        viewModelScope.launch {
-            val hasPlaylistFile = fileUris.any { uri ->
-                val name = DocumentFile.fromSingleUri(app, uri)?.name ?: ""
-                hasExtension(name, "cue", "m3u")
-            }
-            if (hasPlaylistFile && !hasAllFilesAccess()) {
-                pendingAddRomUris = fileUris
-                _state.value = _state.value.copy(
-                    needsSafGrant = true,
-                    safGrantTarget = SafGrantTarget.AllFilesAccess,
-                    pendingSafGrantTargets = listOf(SafGrantTarget.AllFilesAccess)
-                )
-                return@launch
-            }
-
-            val credentials = requireCredentials(PendingCredentialAction.AddRom(fileUris)) ?: return@launch
-            val estimate = withContext(Dispatchers.IO) { estimateQueueForDocuments(app, db, fileUris) }
-            if (estimate.needsConfirmation && !confirmLargeQueue(estimate)) {
-                SnackbarManager.showMessage(str(R.string.scan_cancelled), SnackbarDuration.Short)
-                return@launch
-            }
-            val total = fileUris.size
-            _state.value = _state.value.copy(scanInProgress = true)
-            val message = try {
-                val (skipped, firstBatch) = hashThenCacheFirstBatch(
-                    credentials,
-                    onAbort = null,
-                    shouldCache = { true }
-                ) { onHashed, onQueued ->
-                    var skipped = 0
-                    for ((index, uri) in fileUris.withIndex()) {
-                        val result = scanRomFolder(app, uri, db, singleFile = true, onQueued = onQueued) { _, _, fileName ->
-                            onHashed(CachingProgress(CachingPhase.Hashing, index + 1, total, fileName))
-                        }
-                        skipped += result.skipped
-                    }
-                    skipped
-                }
-                cachingResultMessage(R.string.scan_add_complete, firstBatch, skipped)
-            } finally {
-                CachingNotifications.report(app, null)
-                _state.value = _state.value.copy(
-                    scanInProgress = false,
-                    scanProgress = null
-                )
-                SnackbarManager.showProgress(null)
-            }
-            SnackbarManager.showMessage(message, SnackbarDuration.Indefinite)
-        }
-    }
-
     fun clearCache() {
         viewModelScope.launch(Dispatchers.IO) {
             db.cacheDao().deleteByKeyPrefix(CacheKeys.PREFIX_PATCH)
@@ -1682,6 +1673,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun rememberFolder(treeUri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) { WatchFolders.add(application, db, treeUri) }
+    }
+
+    fun setFolderWatching(folder: WatchedFolder, watching: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            WatchFolders.setWatching(db, folder.uri, watching)
+            if (watching) ProxyService.wakeFolderWatch()
+        }
+    }
+
+    fun removeFolder(folder: WatchedFolder) {
+        viewModelScope.launch(Dispatchers.IO) { WatchFolders.remove(db, folder.uri) }
+    }
+
     fun deleteCachedGame(game: CachedGame) {
         removeCachedGamesFromState(setOf(game.gameId))
         viewModelScope.launch(Dispatchers.IO) {
@@ -1706,42 +1712,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val remaining = _state.value.cachedGames.filter { it.gameId !in gameIds }
         _cachedGames.value = remaining
         _state.value = _state.value.copy(cachedGames = remaining)
-    }
-
-    fun refreshGames() {
-        val app = getApplication<Application>()
-        viewModelScope.launch {
-            val credentials = requireCredentials(PendingCredentialAction.RefreshGames) ?: return@launch
-            val refreshTargets = withContext(Dispatchers.IO) { loadCachedGameRefreshTargets(db) }
-            val startingMessage = str(R.string.refresh_progress, 0, refreshTargets.size)
-            _state.value = _state.value.copy(scanInProgress = true, scanProgress = startingMessage)
-            SnackbarManager.showProgress(startingMessage)
-            val userAgent = withContext(Dispatchers.IO) { proxyUserAgent(loadUserAgent(db)) }
-            withContext(Dispatchers.IO) {
-                for ((index, target) in refreshTargets.withIndex()) {
-                    applyScanBatchCooldown(index, "RAProxy/Refresh")
-                    val title = _state.value.cachedGames.firstOrNull { it.gameId == target.gameId.toString() }?.title
-                        ?: target.gameId.toString()
-                    val progressMessage = str(R.string.refresh_progress_named, index + 1, refreshTargets.size, title)
-                    _state.value = _state.value.copy(scanProgress = progressMessage)
-                    SnackbarManager.showProgress(progressMessage)
-                    refreshCachedGameOfflineBundle(
-                        context = app,
-                        target = target,
-                        creds = credentials,
-                        userAgent = userAgent,
-                        db = db,
-                        notificationMode = RefreshNotificationMode.Foreground
-                    )
-                }
-            }
-            _state.value = _state.value.copy(
-                scanInProgress = false,
-                scanProgress = null
-            )
-            SnackbarManager.showProgress(null)
-            SnackbarManager.showMessage(str(R.string.refresh_complete, refreshTargets.size), SnackbarDuration.Indefinite)
-        }
     }
 
     private var smartCacheJob: Job? = null
@@ -1898,8 +1868,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val points: Int,
         val badgeName: String?,
         val core: Boolean
-    )
+    ) {
+        val listed: Boolean get() = id > 0 && id != WARNING_ACHIEVEMENT_ID && core
+    }
 
+    // Only what a list row needs. Keeping every achievement's texts for thousands of cached games
+    // exceeds the app's heap, so achievement details are parsed when a game is expanded.
     private class ParsedPatch(
         val cacheKey: String,
         val cachedAt: Long,
@@ -1909,38 +1883,40 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val consoleId: Int,
         val imagePath: String?,
         val imageUrl: String?,
-        val achievements: List<ParsedAchievement>
+        val achievementIds: IntArray,
+        val listedAchievementIds: IntArray
     )
 
     private class CachedUnlocks(val cachedAt: Long, val ids: Set<Int>)
 
+    private class CachedAwardAchievement(val summaryId: Long, val cachedAt: Long, val achievement: ParsedAchievement)
+
     private inner class PatchView(
         val summary: CacheEntrySummary,
-        val parsed: ParsedPatch,
-        private val badgeNames: Set<String>
+        val parsed: ParsedPatch
     ) {
         val gameId: String get() = parsed.gameId
         val user: String get() = parsed.user
-        val achievements: List<ParsedAchievement> get() = parsed.achievements
 
         val imageIconUrl: String? by lazy {
             parsed.gameId.toIntOrNull()?.let { resolveCachedGameIconPath(application, it) }
                 ?: parsed.imagePath?.let { resolveCachedStaticAsset(application, it)?.absolutePath }
                 ?: parsed.imageUrl
         }
-
-        fun badgeUrl(achievement: ParsedAchievement): String? = achievement.badgeName?.let { name ->
-            if ("$name.png" in badgeNames) cachedBadgePath(application, name)
-            else "https://i.retroachievements.org/Badge/$name.png"
-        }
     }
 
     private class AchievementRef(val patch: PatchView, val achievement: ParsedAchievement)
+
+    private fun badgeUrl(achievement: ParsedAchievement): String? = achievement.badgeName?.let { name ->
+        val cachedPath = cachedBadgePath(application, name)
+        if (File(cachedPath).length() > 0L) cachedPath else "https://i.retroachievements.org/Badge/$name.png"
+    }
 
     private fun parsePatch(summary: CacheEntrySummary, body: String): ParsedPatch? {
         val parts = summary.cacheKey.split(":")
         if (parts.size < 3) return null
         val patchData = runCatching { JSONObject(body).getJSONObject("PatchData") }.getOrNull()
+        val achievements = parseAchievements(patchData?.optJSONArray("Achievements"))
         return ParsedPatch(
             cacheKey = summary.cacheKey,
             cachedAt = summary.cachedAt,
@@ -1950,7 +1926,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             consoleId = patchData?.optInt("ConsoleID", 0) ?: 0,
             imagePath = patchData?.let(::patchImagePath),
             imageUrl = patchData?.let(::patchImageUrl),
-            achievements = parseAchievements(patchData?.optJSONArray("Achievements"))
+            achievementIds = achievements.map { it.id }.toIntArray(),
+            listedAchievementIds = achievements.filter { it.listed }.map { it.id }.toIntArray()
         )
     }
 
@@ -1975,10 +1952,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private suspend fun loadPatchViews(
-        summaries: List<CacheEntrySummary>,
-        badgeNames: Set<String>
-    ): List<PatchView> {
+    private suspend fun loadAchievements(summary: CacheEntrySummary): List<ParsedAchievement>? {
+        val body = db.cacheDao().bodyForSummary(summary) ?: return null
+        val patchData = runCatching { JSONObject(body).getJSONObject("PatchData") }.getOrNull() ?: return null
+        return parseAchievements(patchData.optJSONArray("Achievements"))
+    }
+
+    private suspend fun loadPatchViews(summaries: List<CacheEntrySummary>): List<PatchView> {
         val views = ArrayList<PatchView>(summaries.size)
         for (summary in summaries) {
             val parsed = patchCache[summary.id]
@@ -1987,32 +1967,60 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     ?.let { body -> parsePatch(summary, body) }
                     ?.also { patchCache[summary.id] = it }
                 ?: continue
-            views += PatchView(summary, parsed, badgeNames)
+            views += PatchView(summary, parsed)
         }
         patchCache.keys.retainAll(summaries.mapTo(HashSet()) { it.id })
         return views
     }
 
-    private fun buildAchievementIndex(patches: List<PatchView>): Map<Int, AchievementRef> = buildMap {
-        patches.forEach { patch ->
-            patch.achievements.forEach { achievement ->
-                putIfAbsent(achievement.id, AchievementRef(patch, achievement))
+    private suspend fun buildAchievementIndex(
+        patches: List<PatchView>,
+        achievementIds: Set<Int>
+    ): Map<Int, AchievementRef> {
+        awardAchievementCache.keys.retainAll(achievementIds)
+        if (achievementIds.isEmpty()) return emptyMap()
+        val index = HashMap<Int, AchievementRef>()
+        for (patch in patches) {
+            val wanted = patch.parsed.achievementIds.filter { it in achievementIds && it !in index }
+            if (wanted.isEmpty()) continue
+            val missing = wanted.filter { id ->
+                val cached = awardAchievementCache[id]
+                    ?.takeIf { it.summaryId == patch.summary.id && it.cachedAt == patch.summary.cachedAt }
+                    ?: return@filter true
+                index[id] = AchievementRef(patch, cached.achievement)
+                false
             }
+            if (missing.isNotEmpty()) {
+                loadAchievements(patch.summary).orEmpty()
+                    .filter { it.id in missing }
+                    .forEach { achievement ->
+                        awardAchievementCache[achievement.id] =
+                            CachedAwardAchievement(patch.summary.id, patch.summary.cachedAt, achievement)
+                        index.putIfAbsent(achievement.id, AchievementRef(patch, achievement))
+                    }
+            }
+            if (index.size == achievementIds.size) break
         }
+        return index
     }
 
     private suspend fun unlockedIdsFor(summary: CacheEntrySummary?): Set<Int> {
         if (summary == null) return emptySet()
         unlockCache[summary.id]?.let { if (it.cachedAt == summary.cachedAt) return it.ids }
+        val ids = loadUnlockedIds(summary)
+        unlockCache[summary.id] = CachedUnlocks(summary.cachedAt, ids)
+        return ids
+    }
+
+    private suspend fun loadUnlockedIds(summary: CacheEntrySummary?): Set<Int> {
+        if (summary == null) return emptySet()
         val body = db.cacheDao().bodyForSummary(summary) ?: return emptySet()
-        val ids = runCatching {
+        return runCatching {
             val unlocks = JSONObject(body).optJSONArray("UserUnlocks") ?: return@runCatching emptySet()
             buildSet(unlocks.length()) {
                 for (i in 0 until unlocks.length()) add(unlocks.optInt(i))
             }
         }.getOrDefault(emptySet())
-        unlockCache[summary.id] = CachedUnlocks(summary.cachedAt, ids)
-        return ids
     }
 
     private suspend fun buildCachedGame(
@@ -2021,7 +2029,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         pendingAwardCount: Int
     ): CachedGame {
         val unlocked = unlockedIdsFor(unlockSummary)
-        val coreAchievements = patch.achievements.filter { it.id > 0 && it.id != WARNING_ACHIEVEMENT_ID && it.core }
         return CachedGame(
             gameId = patch.gameId,
             title = patch.parsed.title,
@@ -2031,21 +2038,29 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             cachedAt = patch.summary.cachedAt,
             imageIconUrl = patch.imageIconUrl,
             unlockedCount = unlocked.size,
+            unlockedListedCount = patch.parsed.listedAchievementIds.count { it in unlocked },
             pendingAwardCount = pendingAwardCount,
-            totalAchievements = coreAchievements.size,
-            achievements = coreAchievements
-                .map { achievement ->
-                    CachedAchievement(
-                        id = achievement.id,
-                        title = achievement.title ?: str(R.string.achievement_fallback, achievement.id),
-                        description = achievement.description,
-                        points = achievement.points,
-                        badgeUrl = patch.badgeUrl(achievement),
-                        unlocked = unlocked.contains(achievement.id)
-                    )
-                }
-                .sortedByDescending { it.unlocked }
+            totalAchievements = patch.parsed.listedAchievementIds.size
         )
+    }
+
+    suspend fun cachedGameAchievements(game: CachedGame): List<CachedAchievement> = withContext(Dispatchers.IO) {
+        val summary = db.cacheDao().getSummary(CacheKeys.patchPrefix(game.gameId) + game.user)
+            ?: return@withContext emptyList()
+        val unlocked = loadUnlockedIds(db.cacheDao().getSummary(CacheKeys.unlocks(game.gameId, game.user)))
+        loadAchievements(summary).orEmpty()
+            .filter { it.listed }
+            .map { achievement ->
+                CachedAchievement(
+                    id = achievement.id,
+                    title = achievement.title ?: str(R.string.achievement_fallback, achievement.id),
+                    description = achievement.description,
+                    points = achievement.points,
+                    badgeUrl = badgeUrl(achievement),
+                    unlocked = achievement.id in unlocked
+                )
+            }
+            .sortedByDescending { it.unlocked }
     }
 
     private fun resolvePendingAward(
@@ -2069,7 +2084,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             gameIconUrl = ref.patch.imageIconUrl
             achievementTitle = ref.achievement.title ?: achievementTitle
             points = ref.achievement.points
-            badgeUrl = ref.patch.badgeUrl(ref.achievement)
+            badgeUrl = badgeUrl(ref.achievement)
         } else {
             gameTitle = award.snapshotGameTitle ?: gameTitle
             achievementTitle = award.snapshotAchievementTitle ?: achievementTitle
@@ -2270,6 +2285,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
             if (loginCredentials == null) {
                 SnackbarManager.showError(str(R.string.manual_credentials_invalid))
+                promptForCredentials()
                 return@launch
             }
 
@@ -2283,15 +2299,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
 
+            credentialsPromptActive = false
             _state.value = _state.value.copy(hasLoginCredentials = true, authState = AuthState.Unknown)
             validateToken()
 
             val action = pendingCredentialAction
             pendingCredentialAction = null
             when (action) {
+                is PendingCredentialAction.StartProxy -> startProxy(action.treeUri)
+                is PendingCredentialAction.FinishProxyStart -> finishAutoPatchedProxyStart(action.alreadyRunning)
                 PendingCredentialAction.SmartCache -> startSmartCache()
-                PendingCredentialAction.RefreshGames -> refreshGames()
-                is PendingCredentialAction.AddRom -> addRom(action.uris)
                 is PendingCredentialAction.ScanRoms -> scanRoms(action.treeUri)
                 null -> Unit
             }
@@ -2497,13 +2514,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private suspend fun compactCachedShadowPatches() {
-        val patchEntries = runCatching { db.cacheDao().getAllByPrefix(CacheKeys.PREFIX_PATCH) }.getOrDefault(emptyList())
-        patchEntries.forEach { entry ->
+    private suspend fun compactCachedShadowPatches() = runCatching {
+        db.cacheDao().forEachEntryByPrefix(CacheKeys.PREFIX_PATCH) { entry ->
             val normalized = runCatching {
                 normalizeCachedResponse("patch", "", "", entry.responseBody)
-            }.getOrNull() ?: return@forEach
-            if (normalized == entry.responseBody) return@forEach
+            }.getOrNull() ?: return@forEachEntryByPrefix
+            if (normalized == entry.responseBody) return@forEachEntryByPrefix
             db.cacheDao().upsert(
                 entry.copy(
                     responseBody = normalized,
@@ -2513,14 +2529,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private suspend fun compactCachedRawAchievementSets() {
-        val rawEntries = runCatching { db.cacheDao().getAllByPrefix(CacheKeys.PREFIX_ACHIEVEMENTSETS) }.getOrDefault(emptyList())
-        rawEntries.forEach { entry ->
-            if (!shouldCompactAchievementSets("achievementsets", entry.responseBody)) return@forEach
+    private suspend fun compactCachedRawAchievementSets() = runCatching {
+        db.cacheDao().forEachEntryByPrefix(CacheKeys.PREFIX_ACHIEVEMENTSETS) { entry ->
+            if (!shouldCompactAchievementSets("achievementsets", entry.responseBody)) return@forEachEntryByPrefix
             val compacted = runCatching {
                 compactCachedRawResponse("achievementsets", entry.responseBody)
-            }.getOrNull() ?: return@forEach
-            if (compacted == entry.responseBody) return@forEach
+            }.getOrNull() ?: return@forEachEntryByPrefix
+            if (compacted == entry.responseBody) return@forEachEntryByPrefix
             db.cacheDao().upsert(
                 entry.copy(
                     responseBody = compacted,

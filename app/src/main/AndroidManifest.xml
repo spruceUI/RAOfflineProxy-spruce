@@ -21,7 +21,7 @@
         android:name="${applicationId}.permission.CONTROL_PROXY"
         android:label="@string/permission_control_proxy_label"
         android:description="@string/permission_control_proxy_description"
-        android:protectionLevel="normal" />
+        android:protectionLevel="dangerous" />
 
     <queries>
         <package android:name="com.retroarch.aarch64" />
@@ -34,6 +34,7 @@
         <package android:name="org.ppsspp.ppssppgold" />
         <package android:name="come.nanodata.armsx2" />
         <package android:name="com.armsx2" />
+        <package android:name="com.armsx2.nightly" />
         <package android:name="com.flycast.emulator" />
         <package android:name="me.magnum.melondualds" />
         <package android:name="org.mupen64plusae.v3.alpha" />
@@ -41,6 +42,10 @@
         <package android:name="com.sbro.emucorex" />
         <package android:name="com.nanodata.armsx" />
         <package android:name="xyz.aethersx2.android" />
+        <package android:name="com.seedlessds.app" />
+        <package android:name="com.seedlessds.app.debug" />
+        <package android:name="com.nendo.argosy" />
+        <package android:name="com.nendo.argosy.debug" />
         <package android:name="moe.shizuku.privileged.api" />
     </queries>
 

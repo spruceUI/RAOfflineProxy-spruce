@@ -7,11 +7,13 @@ DIST_DIR="${SCRIPT_DIR}/dist"
 BUILD_DIR="${DIST_DIR}/raofflineproxy-knulli-bundle"
 APP_DIR="${BUILD_DIR}/app"
 LIB_DIR="${BUILD_DIR}/lib"
-INSTALLER_PATH="${DIST_DIR}/RAOfflineProxy-Knulli-v2.0.0-alpha1-Install.sh"
+INSTALLER_PATH="${DIST_DIR}/RAOfflineProxy-Knulli-v2.3.0-alpha1-Install.sh"
 TEMP_TARBALL="${DIST_DIR}/.raofflineproxy-knulli-bundle.tar.gz"
 
 TARGET="aarch64-linux-gnu.2.17" OUT_DIR="${SCRIPT_DIR}/native" \
   "${LINUX_DIR}/build_rchash.sh"
+
+"${SCRIPT_DIR}/fetch_sqlite.sh"
 
 rm -rf "${BUILD_DIR}"
 rm -f "${DIST_DIR}/raofflineproxy-knulli-bundle.tar.gz"
@@ -21,6 +23,9 @@ mkdir -p "${LIB_DIR}"
 export COPYFILE_DISABLE=1
 
 cp -r "${LINUX_DIR}/raofflineproxy" "${APP_DIR}/raofflineproxy"
+# KNULLI's Python has no sqlite3; storage.py picks this up only when the firmware has none.
+mkdir -p "${APP_DIR}/vendor"
+cp -r "${SCRIPT_DIR}/runtime-cache/sqlite-aarch64" "${APP_DIR}/vendor/sqlite"
 cp "${LINUX_DIR}/requirements.txt" "${APP_DIR}/requirements.txt"
 cp "${LINUX_DIR}/../docs/public/logo-320.png" "${APP_DIR}/raofflineproxy/logo-320.png"
 cp -r "${SCRIPT_DIR}/scripts" "${BUILD_DIR}/scripts"

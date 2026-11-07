@@ -36,7 +36,7 @@
     <string name="proxy_started_success">Proxy started successfully.</string>
     <string name="proxy_stopped_success">Proxy stopped.</string>
     <string name="permission_control_proxy_label">control RAOfflineProxy</string>
-    <string name="permission_control_proxy_description">Allows the app to start and stop the RAOfflineProxy proxy.</string>
+    <string name="permission_control_proxy_description">start and stop the RAOfflineProxy proxy</string>
     <string name="proxy_tooltip_online">Proxy running — online</string>
     <string name="proxy_tooltip_offline">Proxy running — offline</string>
     <string name="proxy_menu_title">Proxy</string>
@@ -52,7 +52,7 @@
     <string name="home_emulators_label">Enabled Emulators</string>
     <string name="home_manual_setup_warning">With your Android version (%1$s), automatic emulator setup will most likely not work on this device. Please consider using Manual Emulator Setup instead. Android builds can differ, so you can still try Start proxy with automatic setup if you want.</string>
     <string name="home_shizuku_info">You are running the proxy through Shizuku.</string>
-    <string name="home_no_emulator_warning">No supported emulator was found. Install RetroArch, Dolphin, PPSSPP, ARMSX2, Flycast, WatermelonDS, Mupen64Plus, EmuCoreX, ARMSX1, or NetherSX2 to use RAOfflineProxy.</string>
+    <string name="home_no_emulator_warning">No supported emulator was found. Install RetroArch, Dolphin, PPSSPP, ARMSX2, Flycast, WatermelonDS, Mupen64Plus, EmuCoreX, ARMSX1, NetherSX2, or SeedlessDS to use RAOfflineProxy.</string>
     <string name="home_go_to_cached_games">Cached Games</string>
     <string name="btn_support_development">💛 Support me</string>
     <string name="support_dialog_title">💛 Support RAOfflineProxy</string>
@@ -83,6 +83,7 @@
     <string name="emulator_emucorex">EmuCoreX</string>
     <string name="emulator_armsx1">ARMSX1</string>
     <string name="emulator_nethersx2">NetherSX2</string>
+    <string name="emulator_seedlessds">SeedlessDS</string>
     <string name="emulator_toggle_icon_cd">Installed emulator icon</string>
     <string name="emulator_selector_caret">▼</string>
     <string name="emulator_selector_cd">Enabled emulators, tap to change</string>
@@ -149,6 +150,8 @@
     <string name="armsx1_patch_success">ARMSX1 patched successfully.</string>
     <string name="armsx1_patch_error_unavailable">Could not patch ARMSX1 automatically. Make sure a supported ARMSX1 build is installed and try again.</string>
     <string name="nethersx2_patch_success">NetherSX2 patched successfully.</string>
+    <string name="seedlessds_patch_success">SeedlessDS patched successfully.</string>
+    <string name="seedlessds_patch_error_unavailable">Could not patch SeedlessDS automatically. Make sure a supported SeedlessDS build is installed and try again.</string>
     <string name="nethersx2_patch_error_unavailable">Could not patch NetherSX2 automatically. Make sure a supported NetherSX2 build is installed and try again.</string>
     <!-- CFG revert messages -->
     <string name="revert_already_reverted">Already reverted — no changes needed.</string>
@@ -182,6 +185,8 @@
     <string name="armsx1_revert_success">ARMSX1 reverted successfully.</string>
     <string name="armsx1_revert_error_unavailable">Could not revert ARMSX1 automatically. Reopen the app and try again.</string>
     <string name="nethersx2_revert_success">NetherSX2 reverted successfully.</string>
+    <string name="seedlessds_revert_success">SeedlessDS reverted successfully.</string>
+    <string name="seedlessds_revert_error_unavailable">Could not revert SeedlessDS automatically. Reopen the app and try again.</string>
     <string name="nethersx2_revert_error_unavailable">Could not revert NetherSX2 automatically. Reopen the app and try again.</string>
 
     <!-- Flush messages -->
@@ -205,7 +210,6 @@
     <!-- Scan / add ROM messages -->
 <string name="caching_hashing_progress">Hashing %1$d/%2$d: %3$s</string>
     <string name="caching_caching_progress">Caching %1$d/%2$d: %3$s</string>
-    <string name="scan_add_complete">Added: %1$d cached, %2$d queued, %3$d skipped.</string>
     <string name="scan_starting">Starting scan…</string>
     <string name="scan_aborting">Aborting scan…</string>
     <string name="scan_complete">Scan complete: %1$d cached, %2$d queued, %3$d skipped.</string>
@@ -236,17 +240,13 @@
     <string name="app_update_action_download">Install update</string>
     <string name="app_update_action_release_notes">View release notes</string>
     <string name="app_update_action_later">Not now</string>
+    <string name="app_update_channel_name">App updates</string>
     <string name="app_update_toolbar_action">Update available</string>
     <string name="app_update_downloading">Downloading update…</string>
     <string name="app_update_download_failed">Download failed. Opening in browser instead.</string>
     <string name="app_update_allow_installs_title">Allow installs from this app</string>
     <string name="app_update_allow_installs_message">To install the update directly, allow RAOfflineProxy to install apps. You will be taken to the system settings screen.</string>
     <string name="app_update_allow_installs_open_settings">Open settings</string>
-
-    <!-- Refresh messages -->
-    <string name="refresh_progress">Refreshing %1$d/%2$d…</string>
-    <string name="refresh_progress_named">Refreshing %1$d/%2$d: %3$s</string>
-    <string name="refresh_complete">Refreshed %d game(s).</string>
 
     <!-- Clear cache/database -->
     <string name="cache_cleared">Cache cleared.</string>
@@ -303,7 +303,7 @@
     <string name="setting_smart_caching_label">Enable smart caching</string>
     <string name="setting_smart_caching_caption">Automatically prefetches achievement data for offline play when the proxy starts</string>
     <string name="setting_app_update_check_label">Enable update checker</string>
-    <string name="setting_app_update_check_caption">Checks for new app versions on startup</string>
+    <string name="setting_app_update_check_caption">Checks for new app versions on startup and about once a day while the proxy runs</string>
     <string name="setting_hide_support_button_label">Hide "Support me"-button</string>
     <string name="setting_hide_support_button_caption">Hides the donation button on the home screen</string>
     <string name="setting_usage_stats_label">Share anonymous usage statistics</string>
@@ -327,14 +327,28 @@
     <!-- Cached games header -->
     <string name="cached_games_scan_hint">Go online and make sure RAOfflineProxy has imported your RetroAchievements credentials to manage cached games.</string>
 
-    <string name="cached_games_offline_hint">Go online to add, scan, or refresh cached games.</string>
+    <string name="cached_games_offline_hint">Go online to add or scan games.</string>
     <string name="cached_games_counter">%1$d cached</string>
-    <string name="cached_games_counter_queued">%1$d cached · %2$d queued</string>
+    <string name="cached_games_queued">%1$d queued</string>
     <string name="cached_games_counter_with_queue_status">%1$s · %2$s</string>
     <string name="cached_games_queue_next_batch">next batch %1$s</string>
     <string name="cached_games_queue_next_batch_soon">next batch soon</string>
     <string name="cached_games_queue_caching_now">caching now</string>
-    <string name="cached_games_counter_queued_paused">%1$d cached · %2$d queued (paused while the proxy is stopped)</string>
+    <string name="cached_games_queued_paused">%1$d queued (paused while the proxy is stopped)</string>
+    <plurals name="cached_games_folders">
+        <item quantity="one">%d folder</item>
+        <item quantity="other">%d folders</item>
+    </plurals>
+    <string name="watch_folders_title">Folders</string>
+    <string name="watch_folders_hint">Watched folders are checked for new ROMs every 30 minutes while the proxy is running. New games are cached automatically.</string>
+    <string name="watch_folders_empty">No folders yet. Scan a ROM folder to add one.</string>
+    <string name="watch_folders_start">Watch folder</string>
+    <string name="watch_folders_stop">Stop watching folder</string>
+    <string name="watch_folders_remove">Remove folder</string>
+    <string name="watch_folders_not_checked">Not checked yet</string>
+    <string name="watch_folders_last_checked">Last checked %1$s</string>
+    <string name="watch_folders_not_watching">Not watched</string>
+    <string name="watch_folders_close">Close</string>
 
     <!-- Caching queue confirmation -->
     <string name="queue_confirm_title">Cache in the background?</string>
@@ -342,9 +356,9 @@
     <string name="queue_confirm_continue">Continue</string>
     <string name="queue_eta_minutes">%1$d minutes</string>
     <string name="queue_eta_hours">%1$d h %2$d min</string>
-    <string name="cached_games_refresh">Refresh games</string>
     <string name="cached_games_smart_cache">Start Smart Cache</string>
-    <string name="cached_games_add_rom">Add ROM</string>
+    <string name="cached_games_search">Search games</string>
+    <string name="cached_games_search_hint">Search games</string>
     <string name="cached_games_scan_folder">Scan ROM folder</string>
     <string name="cached_games_clear_all">Clear all cache</string>
     <string name="cached_games_empty">No games cached yet. Add a ROM or scan your ROM folder while online.</string>
@@ -389,6 +403,10 @@
     <string name="manual_patching_checkbox">Activate manual emulator patching</string>
     <string name="manual_credentials_dialog_title">RetroAchievements login</string>
     <string name="manual_credentials_message">Manual emulator patching cannot import your RetroAchievements login from emulator config files. Enter your RetroAchievements username and password so RAOfflineProxy can request the correct login token.</string>
+    <string name="login_choice_title">RetroAchievements login</string>
+    <string name="login_choice_message">Log in now to cache games for offline play right away. You can also start without logging in: your login is picked up automatically the first time you play online through RAOfflineProxy.</string>
+    <string name="login_choice_login">Log in now</string>
+    <string name="login_choice_skip">Start without</string>
     <string name="credentials_for_caching_message">No RetroAchievements credentials found. Enter your username and password to continue.</string>
     <string name="manual_credentials_username_label">Username</string>
     <string name="manual_credentials_password_label">Password</string>

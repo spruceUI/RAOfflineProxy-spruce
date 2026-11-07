@@ -39,7 +39,7 @@ internal object HeadlessProxy {
 
     fun start(context: Context): HeadlessStartResult {
         val emulatorSupport = loadEmulatorSupport(context)
-        if (!emulatorSupport.hasAnyEnabled) return HeadlessStartResult.NoEmulatorEnabled
+        if (!emulatorSupport.canStartProxy) return HeadlessStartResult.NoEmulatorEnabled
         if (!isLoopbackPortAvailable(PrefsConstants.loadProxyPort(context))) return HeadlessStartResult.PortUnavailable
 
         val prefs = context.getSharedPreferences(PrefsConstants.PREFS_NAME, Context.MODE_PRIVATE)
@@ -156,7 +156,7 @@ internal object HeadlessProxy {
             )
             if (result.success && result.copyBackPath == null) {
                 prefs.edit {
-                    remove(config.hardcoreWasEnabledPrefsKey)
+                    remove(emulator.hardcoreWasEnabledPrefsKey)
                     remove(emulator.patchedThisRunPrefsKey)
                 }
             }
@@ -187,10 +187,10 @@ internal object HeadlessProxy {
 
         prefs.edit {
             if (isConfigReadyForAutostart(enabled, result) && !result.skippedNotInstalled) {
-                putBoolean(config.hardcoreWasEnabledPrefsKey, result.hardcoreWasEnabled)
+                putBoolean(emulator.hardcoreWasEnabledPrefsKey, result.hardcoreWasEnabled)
                 putBoolean(emulator.patchedThisRunPrefsKey, true)
             } else {
-                remove(config.hardcoreWasEnabledPrefsKey)
+                remove(emulator.hardcoreWasEnabledPrefsKey)
                 remove(emulator.patchedThisRunPrefsKey)
             }
         }
@@ -235,7 +235,7 @@ internal fun revertPatchedEmulatorConfigs(context: Context) {
                 context = context,
                 emulator = emulator,
                 treeUri = loadConfigSafUri(context, emulator),
-                restoreHardcore = prefs.getBoolean(config.hardcoreWasEnabledPrefsKey, false)
+                restoreHardcore = prefs.getBoolean(emulator.hardcoreWasEnabledPrefsKey, false)
             )
         } else {
             configNotPatchedResult(emulator)
@@ -252,7 +252,7 @@ internal fun revertPatchedEmulatorConfigs(context: Context) {
     configResults.forEach { (emulator, result) ->
         if (!result.success || result.copyBackPath != null) return@forEach
         prefs.edit {
-            remove(requireConfigOverride(emulator).hardcoreWasEnabledPrefsKey)
+            remove(emulator.hardcoreWasEnabledPrefsKey)
             remove(emulator.patchedThisRunPrefsKey)
         }
         Log.i(TAG, "${emulator.displayName} config reverted during proxy shutdown")

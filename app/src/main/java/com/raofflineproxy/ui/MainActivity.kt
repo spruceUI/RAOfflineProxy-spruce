@@ -61,6 +61,9 @@ class MainActivity : AppCompatActivity() {
     private var suppressNextDismissCallback = false
     private var activeSafGrantTarget: SafGrantTarget? = null
     private var usageStatsDialogShown = false
+    private var usageStatsDialog: AlertDialog? = null
+    private var smartCachePromptDialog: AlertDialog? = null
+    private var smartCachePromptPending = false
     private var attemptedGenericAllFilesAccess = false
     private var pendingQuit = false
     private val shizukuPermissionListener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
@@ -266,7 +269,7 @@ class MainActivity : AppCompatActivity() {
                     isOnline = state.isOnline,
                     proxyToggleInProgress = state.proxyToggleInProgress,
                     needsSafGrant = state.needsSafGrant,
-                    hasEnabledEmulator = state.hasEnabledEmulator,
+                    hasEnabledEmulator = state.canStartWithoutEmulator,
                     canStartProxy = !state.manualEmulatorPatchingEnabled || state.shizukuManualPatchingEnabled || !state.hasShizukuManagedEnabledEmulator
                 )
                 updateAppUpdateMenuItem(state.availableAppUpdate)
@@ -281,7 +284,9 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     activeSafGrantTarget = null
                 }
-                if (state.hasLoginCredentials && state.usageStatsConsent == null && !usageStatsDialogShown) {
+                if (state.hasLoginCredentials && state.usageStatsConsent == null && !usageStatsDialogShown &&
+                    smartCachePromptDialog?.isShowing != true
+                ) {
                     usageStatsDialogShown = true
                     showUsageStatsConsentDialog()
                 }
@@ -309,6 +314,7 @@ class MainActivity : AppCompatActivity() {
                     MainUiEvent.PromptSmartCacheAfterProxyStart -> showSmartCacheAfterProxyStartDialog()
                     MainUiEvent.PromptManualCredentials -> showManualCredentialsDialog()
                     MainUiEvent.PromptCredentialsForCaching -> showCredentialsForCachingDialog()
+                    MainUiEvent.PromptLoginChoice -> showLoginChoiceDialog()
                     MainUiEvent.PromptPpssppShizukuRootMode -> showPpssppShizukuRootModeDialog()
                     MainUiEvent.OpenShizukuGuide -> openUrl(getString(R.string.manual_patching_shizuku_guide_url))
                     MainUiEvent.RequestShizukuPermission -> Shizuku.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE)
@@ -352,7 +358,7 @@ class MainActivity : AppCompatActivity() {
             isOnline = state.isOnline,
             proxyToggleInProgress = state.proxyToggleInProgress,
             needsSafGrant = state.needsSafGrant,
-            hasEnabledEmulator = state.hasEnabledEmulator,
+            hasEnabledEmulator = state.canStartWithoutEmulator,
             canStartProxy = !state.manualEmulatorPatchingEnabled || state.shizukuManualPatchingEnabled || !state.hasShizukuManagedEnabledEmulator
         )
         updateAppUpdateMenuItem(state.availableAppUpdate)
@@ -612,7 +618,11 @@ class MainActivity : AppCompatActivity() {
         Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
 
     private fun showSmartCacheAfterProxyStartDialog() {
-        AlertDialog.Builder(this)
+        if (usageStatsDialog?.isShowing == true) {
+            smartCachePromptPending = true
+            return
+        }
+        smartCachePromptDialog = AlertDialog.Builder(this)
             .setTitle(R.string.smart_cache_prompt_title)
             .setMessage(R.string.smart_cache_prompt_message)
             .setPositiveButton(R.string.smart_cache_prompt_start) { _, _ ->
@@ -620,8 +630,18 @@ class MainActivity : AppCompatActivity() {
             }
             .setNegativeButton(R.string.smart_cache_prompt_not_now, null)
             .create()
-            .also { it.setCanceledOnTouchOutside(false) }
-            .show()
+            .also {
+                it.setCanceledOnTouchOutside(false)
+                it.setOnDismissListener {
+                    smartCachePromptDialog = null
+                    val state = viewModel.state.value
+                    if (state.hasLoginCredentials && state.usageStatsConsent == null && !usageStatsDialogShown) {
+                        usageStatsDialogShown = true
+                        showUsageStatsConsentDialog()
+                    }
+                }
+                it.show()
+            }
     }
 
     private fun showManualCredentialsDialog() {
@@ -663,6 +683,19 @@ class MainActivity : AppCompatActivity() {
         dialog.show()
     }
 
+    private fun showLoginChoiceDialog() {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.login_choice_title)
+            .setMessage(R.string.login_choice_message)
+            .setPositiveButton(R.string.login_choice_login) { _, _ -> viewModel.chooseLogin() }
+            .setNegativeButton(R.string.login_choice_skip) { _, _ -> viewModel.chooseStartWithoutLogin() }
+            .setNeutralButton(android.R.string.cancel) { _, _ -> viewModel.cancelCredentialsPrompt() }
+            .setOnCancelListener { viewModel.cancelCredentialsPrompt() }
+            .create()
+            .also { it.setCanceledOnTouchOutside(false) }
+            .show()
+    }
+
     private fun showCredentialsForCachingDialog() {
         val dialogView = LayoutInflater.from(this)
             .inflate(R.layout.dialog_manual_credentials, binding.fragmentContainer, false)
@@ -677,7 +710,8 @@ class MainActivity : AppCompatActivity() {
             .setTitle(R.string.manual_credentials_dialog_title)
             .setView(dialogView)
             .setPositiveButton(R.string.manual_credentials_save, null)
-            .setNegativeButton(android.R.string.cancel, null)
+            .setNegativeButton(android.R.string.cancel) { _, _ -> viewModel.cancelCredentialsPrompt() }
+            .setOnCancelListener { viewModel.cancelCredentialsPrompt() }
             .create()
 
         dialog.setOnShowListener {
@@ -725,6 +759,14 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        dialog.setOnDismissListener {
+            usageStatsDialog = null
+            if (smartCachePromptPending) {
+                smartCachePromptPending = false
+                showSmartCacheAfterProxyStartDialog()
+            }
+        }
+        usageStatsDialog = dialog
         dialog.show()
     }
 
@@ -1001,10 +1043,10 @@ private class OpenAndroidDataTree : ActivityResultContract<Unit, Uri?>() {
         if (resultCode == android.app.Activity.RESULT_OK) intent?.data else null
 
     private fun resolveRetroArchPackage(context: Context): String =
-        RETROARCH_PACKAGE_CANDIDATES.firstOrNull { packageName ->
+        Emulator.RetroArch.packageCandidates.firstOrNull { packageName ->
             runCatching { context.packageManager.getPackageInfo(packageName, 0) }
                 .isSuccess
-        } ?: RETROARCH_PACKAGE_CANDIDATES.first()
+        } ?: Emulator.RetroArch.packageCandidates.first()
 }
 
 private class OpenDolphinConfigTree : ActivityResultContract<Unit, Uri?>() {
@@ -1024,16 +1066,16 @@ private class OpenDolphinConfigTree : ActivityResultContract<Unit, Uri?>() {
         if (resultCode == android.app.Activity.RESULT_OK) intent?.data else null
 
     private fun resolveDolphinPackage(context: Context): String =
-        DOLPHIN_PACKAGE_CANDIDATES.firstOrNull { packageName ->
+        Emulator.Dolphin.packageCandidates.firstOrNull { packageName ->
             runCatching { context.packageManager.getPackageInfo(packageName, 0) }
                 .isSuccess
-        } ?: DOLPHIN_PACKAGE_CANDIDATES.first()
+        } ?: Emulator.Dolphin.packageCandidates.first()
 }
 
 private class OpenPpssppRootTree : ActivityResultContract<Unit, Uri?>() {
     override fun createIntent(context: Context, input: Unit): Intent =
         Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
-            val ppssppPackage = resolveInstalledPackage(context, UI_PPSSPP_PACKAGE_CANDIDATES) ?: UI_PPSSPP_PACKAGE
+            val ppssppPackage = resolveInstalledPackage(context, Emulator.Ppsspp.packageCandidates) ?: Emulator.Ppsspp.packageCandidates.first()
             initialTreeUriForPath("/storage/emulated/0/Android/data/$ppssppPackage/files/$PPSSPP_PSP_DIR")
                 ?.let { putExtra(DocumentsContract.EXTRA_INITIAL_URI, it) }
             addFlags(

@@ -20,9 +20,19 @@ Declare the control permission and make the provider visible to your app:
 
 `status` needs no permission. `start` and `stop` throw a `SecurityException` without it.
 
-::: warning Install order
-Android only grants the permission if RAOfflineProxy was installed before your app. If your app was installed first, reinstall it.
-:::
+The user grants the permission, like camera or location access. Request it at runtime, which works whichever app was installed first:
+
+```kotlin
+const val CONTROL_PROXY = "com.raofflineproxy.permission.CONTROL_PROXY"
+
+if (checkSelfPermission(CONTROL_PROXY) != PackageManager.PERMISSION_GRANTED) {
+    requestPermissions(arrayOf(CONTROL_PROXY), REQUEST_CODE)
+}
+```
+
+Android asks "Allow ‹your app› to start and stop the RAOfflineProxy proxy?". If RAOfflineProxy isn't installed yet, the request is denied without a dialog, so ask again once it is. Check the permission before each call: the user can revoke it, and Android may revoke it from apps that go unused for months.
+
+Apps that already hold the permission keep it when RAOfflineProxy updates.
 
 ## Methods
 
@@ -57,28 +67,35 @@ val status = result?.getString("status")
 
 Since Android 12, an app in the background may not start a foreground service. While RAOfflineProxy is in the background, `start` fails with `foreground_service_not_allowed`. Any emulator patches are rolled back and `shouldBeRunning` stays `false`. Setting RAOfflineProxy's battery usage to **Unrestricted** lifts this limit.
 
+`start` returns `ok` once the service has been asked to start. `running` turns `true` once the proxy accepts connections. If Android refuses the service afterwards, which happens when RAOfflineProxy's battery usage is **Restricted**, the proxy stops again and `shouldBeRunning` turns `false`.
+
 `stop` returns `ok` as soon as the proxy has been asked to stop. `running` turns `false` shortly after, once the service is gone.
 
 ## Status
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "running": true,
   "shouldBeRunning": true,
   "online": true,
-  "queue": { "count": 342, "state": "waiting", "nextWindowAt": 1759230000000 }
+  "queue": { "count": 342, "state": "waiting", "nextWindowAt": 1759230000000 },
+  "pendingAwards": { "count": 3, "state": "syncing", "error": null }
 }
 ```
 
 | Field | Meaning |
 |---|---|
-| `running` | The proxy service is running |
-| `shouldBeRunning` | RAOfflineProxy intends the proxy to run. `true` while `running` is `false` means it's about to restart |
+| `version` | `2` since `pendingAwards` was added |
+| `running` | The proxy accepts connections |
+| `shouldBeRunning` | RAOfflineProxy intends the proxy to run. `true` while `running` is `false` means it's starting or about to restart |
 | `online` | RetroAchievements is reachable |
 | `queue.count` | Games waiting in the [caching queue](/caching-games) |
 | `queue.state` | See below |
 | `queue.nextWindowAt` | Epoch milliseconds of the next caching batch while `waiting`, otherwise `null` |
+| `pendingAwards.count` | Achievements unlocked offline that haven't been uploaded yet |
+| `pendingAwards.state` | See below |
+| `pendingAwards.error` | Why the upload failed while `blocked`, otherwise `null` |
 
 | `queue.state` | Meaning |
 |---|---|
@@ -86,6 +103,22 @@ Since Android 12, an app in the background may not start a foreground service. W
 | `caching` | Games are being cached right now |
 | `waiting` | Waiting for the next caching window. RAOfflineProxy wakes the device for it |
 | `blocked` | Won't progress without the user, e.g. the proxy is stopped or the login is invalid. Treat it like `idle` |
+
+Pending awards are uploaded automatically when the proxy starts and whenever RetroAchievements becomes reachable again. A failed upload isn't retried until the next time that happens.
+
+| `pendingAwards.state` | Meaning |
+|---|---|
+| `idle` | Nothing to upload |
+| `waiting` | Awards will upload once RetroAchievements is reachable |
+| `syncing` | Awards are being uploaded right now |
+| `blocked` | The proxy is stopped, or the last upload failed and won't be retried until connectivity drops and returns. Treat it like `idle` |
+
+| `pendingAwards.error` | Meaning |
+|---|---|
+| `auth` | The login was rejected, log in again in RAOfflineProxy |
+| `chain_broken` | The pending awards failed their integrity check, open RAOfflineProxy |
+| `refresh_failed` | The achievement data couldn't be refreshed from RetroAchievements |
+| `upload_failed` | Some awards couldn't be uploaded, e.g. a network or server error |
 
 ## Observing changes
 
@@ -105,3 +138,5 @@ Before sleep:
 
 - `queue.state` is `idle` or `blocked`: call `stop`, start again on wake
 - `queue.state` is `caching` or `waiting`: leave the proxy running until the queue is done, or let the user decide
+
+To sync achievements in a maintenance window, turn Wi-Fi on and keep it on until `online` is `true` and `pendingAwards.state` is `idle` or `blocked`.

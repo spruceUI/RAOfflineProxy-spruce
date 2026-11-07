@@ -2,18 +2,30 @@ package com.raofflineproxy.ui
 
 import android.view.LayoutInflater
 import android.view.View
+import android.text.Editable
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.TextPaint
+import android.text.TextWatcher
+import android.text.method.LinkMovementMethod
+import android.text.style.ClickableSpan
 import android.view.ViewGroup
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
+import android.widget.EditText
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.button.MaterialButton
+import com.google.android.material.color.MaterialColors
 import com.raofflineproxy.R
 
 class CachedGamesHeaderAdapter(
     private val onSmartCache: () -> Unit,
     private val onScan: () -> Unit,
-    private val onAdd: () -> Unit,
-    private val onRefresh: () -> Unit,
-    private val onClear: () -> Unit
+    private val onClear: () -> Unit,
+    private val onFolders: () -> Unit,
+    private val onSearchChanged: (String) -> Unit,
+    private val onSearchToggled: (Boolean) -> Unit
 ) : RecyclerView.Adapter<CachedGamesHeaderAdapter.ViewHolder>() {
 
     private var state: HeaderState = HeaderState()
@@ -22,16 +34,19 @@ class CachedGamesHeaderAdapter(
         val smartCacheEnabled: Boolean = false,
         val showSmartCache: Boolean = true,
         val scanEnabled: Boolean = false,
-        val refreshEnabled: Boolean = false,
         val clearEnabled: Boolean = true,
         val showNoCachedGames: Boolean = false,
-        val statusText: String? = null
+        val statusText: String? = null,
+        val folderCount: Int = 0,
+        val queueStatusText: String? = null,
+        val searchOpen: Boolean = false,
+        val searchQuery: String = ""
     )
 
     inner class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         val btnSmartCache: MaterialButton = view.findViewById(R.id.btn_smart_cache)
-        val btnRefresh: MaterialButton = view.findViewById(R.id.btn_refresh_games)
-        val btnAdd: MaterialButton = view.findViewById(R.id.btn_add_rom)
+        val btnSearch: MaterialButton = view.findViewById(R.id.btn_search)
+        val etSearch: EditText = view.findViewById(R.id.et_search)
         val btnScan: MaterialButton = view.findViewById(R.id.btn_scan_roms)
         val btnClear: MaterialButton = view.findViewById(R.id.btn_clear_cache)
         val tvScanHint: TextView = view.findViewById(R.id.tv_scan_hint)
@@ -40,29 +55,78 @@ class CachedGamesHeaderAdapter(
         init {
             btnSmartCache.setOnClickListener { onSmartCache() }
             btnScan.setOnClickListener { onScan() }
-            btnAdd.setOnClickListener { onAdd() }
-            btnRefresh.setOnClickListener { onRefresh() }
             btnClear.setOnClickListener { onClear() }
+            btnSearch.setOnClickListener { onSearchToggled(!state.searchOpen) }
+            etSearch.addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+                override fun afterTextChanged(s: Editable?) {
+                    val query = s?.toString().orEmpty()
+                    if (query != state.searchQuery) onSearchChanged(query)
+                }
+            })
+            etSearch.setOnEditorActionListener { v, actionId, _ ->
+                if (actionId != EditorInfo.IME_ACTION_SEARCH) return@setOnEditorActionListener false
+                hideKeyboard(v)
+                true
+            }
+        }
+
+        private fun hideKeyboard(target: View) {
+            val imm = target.context.getSystemService(InputMethodManager::class.java)
+            imm?.hideSoftInputFromWindow(target.windowToken, 0)
+        }
+
+        private fun bindSearch(s: HeaderState) {
+            val wasOpen = etSearch.visibility == View.VISIBLE
+            etSearch.visibility = if (s.searchOpen) View.VISIBLE else View.GONE
+            btnSearch.setIconResource(if (s.searchOpen) R.drawable.ic_close else R.drawable.ic_search)
+            if (etSearch.text.toString() != s.searchQuery) etSearch.setText(s.searchQuery)
+            if (s.searchOpen && !wasOpen) {
+                etSearch.requestFocus()
+                etSearch.context.getSystemService(InputMethodManager::class.java)
+                    ?.showSoftInput(etSearch, InputMethodManager.SHOW_IMPLICIT)
+            }
+            if (!s.searchOpen && wasOpen) hideKeyboard(etSearch)
+        }
+
+        private fun statusWithFolders(s: HeaderState): CharSequence? {
+            val status = s.statusText ?: return null
+            val context = tvScanHint.context
+            val text = SpannableStringBuilder(status)
+            if (s.folderCount > 0) {
+                val label = context.resources.getQuantityString(R.plurals.cached_games_folders, s.folderCount, s.folderCount)
+                text.append(" · ")
+                val start = text.length
+                text.append(label)
+                text.setSpan(object : ClickableSpan() {
+                    override fun onClick(widget: View) = onFolders()
+                    override fun updateDrawState(ds: TextPaint) {
+                        ds.color = MaterialColors.getColor(tvScanHint, androidx.appcompat.R.attr.colorPrimary)
+                        ds.isUnderlineText = true
+                    }
+                }, start, text.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
+            s.queueStatusText?.let { text.append(" · ").append(it) }
+            return text
         }
 
         fun bind(s: HeaderState) {
+            bindSearch(s)
             btnSmartCache.visibility = if (s.showSmartCache) View.VISIBLE else View.GONE
             btnSmartCache.isEnabled = s.smartCacheEnabled
             btnSmartCache.alpha = if (s.smartCacheEnabled) 1f else 0.38f
 
             btnScan.isEnabled = s.scanEnabled
-            btnAdd.isEnabled = s.scanEnabled
             btnScan.alpha = if (s.scanEnabled) 1f else 0.38f
-            btnAdd.alpha = if (s.scanEnabled) 1f else 0.38f
-
-            btnRefresh.isEnabled = s.refreshEnabled
-            btnRefresh.alpha = if (s.refreshEnabled) 1f else 0.38f
 
             btnClear.isEnabled = s.clearEnabled
             btnClear.alpha = if (s.clearEnabled) 1f else 0.38f
 
-            tvScanHint.text = s.statusText
-            tvScanHint.visibility = if (s.statusText.isNullOrEmpty()) View.GONE else View.VISIBLE
+            tvScanHint.text = statusWithFolders(s)
+            tvScanHint.movementMethod = LinkMovementMethod.getInstance()
+            tvScanHint.visibility =
+                if (s.statusText.isNullOrEmpty() || s.searchOpen) View.GONE else View.VISIBLE
 
             tvNoCachedGames.visibility = if (s.showNoCachedGames) View.VISIBLE else View.GONE
         }

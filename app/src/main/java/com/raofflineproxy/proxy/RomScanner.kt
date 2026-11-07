@@ -18,6 +18,7 @@ import com.raofflineproxy.throttleRetroAchievementsApiRequest
 import com.raofflineproxy.data.AppDatabase
 import com.raofflineproxy.data.CacheEntry
 import com.raofflineproxy.data.CacheKeys
+import com.raofflineproxy.data.forEachEntryByPrefix
 import com.raofflineproxy.data.PENDING_AWARD_STATUS_PENDING
 import com.raofflineproxy.data.PendingAward
 import com.raofflineproxy.proxyUserAgent
@@ -39,7 +40,7 @@ private const val HTTP_RETRY_AFTER_HEADER = "Retry-After"
 private const val HTTP_GET_MAX_429_RETRIES = 4
 private const val HTTP_GET_INITIAL_429_BACKOFF_MS = 2_000L
 private const val HTTP_GET_MAX_429_BACKOFF_MS = 15_000L
-private const val MAX_SCAN_ENTRIES = 5000
+internal const val MAX_SCAN_ENTRIES = 5000
 private const val MAX_SCAN_DEPTH = 12
 // RetroAchievements adds hashes over time, so a "no match" is only cached long enough to
 // stop a repeated scan of the same folder from re-querying every unsupported ROM.
@@ -85,8 +86,8 @@ internal data class QueueDrainResult(
 }
 
 internal suspend fun loadCachedRomPaths(db: AppDatabase): MutableSet<String> =
-    db.cacheDao().getAllByPrefix(CacheKeys.PREFIX_PATCH)
-        .mapNotNull { entry -> entry.sourceRomPath?.normalizeCachedRomPath() }
+    db.cacheDao().getAllSummariesByPrefix(CacheKeys.PREFIX_PATCH)
+        .mapNotNull { summary -> summary.sourceRomPath?.normalizeCachedRomPath() }
         .toMutableSet()
 
 data class LoginCredentials(val user: String, val token: String)
@@ -120,6 +121,9 @@ internal sealed interface HttpGetResult {
         val bodySnippet: String? = null,
         val exceptionMessage: String? = null
     ) : HttpGetResult {
+        val isAuthRejection: Boolean
+            get() = kind == "http" && statusCode == 401 && bodySnippet?.contains("invalid_credentials") == true
+
         fun logMessage(action: String, url: String): String {
             val target = redactTokens(url)
             return when (kind) {
@@ -213,13 +217,14 @@ suspend fun loginAndCacheToken(
     }
 }
 
-suspend fun refreshGamePatch(
+internal suspend fun refreshGamePatch(
     context: Context,
     gameId: Int,
     creds: LoginCredentials,
     userAgent: String,
     db: AppDatabase,
     cacheImages: Boolean = true,
+    onFailure: (HttpGetResult.Failure) -> Unit = {},
 ): String? {
     val url = buildApiUrl(
         RA_HOST,
@@ -236,6 +241,7 @@ suspend fun refreshGamePatch(
             val logDetails = result.logMessage("patch", url)
             Log.e(TAG, "refreshGamePatch failed for gameId=$gameId: $logDetails")
             RequestFailureNotifier.report(result.userMessage(context, "patch"), logDetails)
+            onFailure(result)
             return null
         }
     }
@@ -264,30 +270,49 @@ suspend fun refreshGamePatch(
     return normalizedBody
 }
 
-internal suspend fun loadCachedGameRefreshTargets(db: AppDatabase): List<CachedGameRefreshTarget> {
-    val patchEntries = db.cacheDao().getAllByPrefix(CacheKeys.PREFIX_PATCH)
-    val achievementSetEntries = db.cacheDao().getAllByPrefix(CacheKeys.PREFIX_ACHIEVEMENTSETS)
-    val achievementSetsByGameAndUser = buildMap<Pair<Int, String>, String> {
-        achievementSetEntries.forEach { entry ->
-            val user = CacheKeys.parseUserFromAchievementSetsKey(entry.cacheKey) ?: return@forEach
-            val hash = CacheKeys.parseAchievementSetsHash(entry.cacheKey) ?: return@forEach
-            val gameId = achievementSetsGameId(entry) ?: return@forEach
-            putIfAbsent(gameId to user, hash)
-        }
+internal suspend fun loadCachedGameRefreshTargets(
+    db: AppDatabase,
+    gameIds: Set<Int>
+): List<CachedGameRefreshTarget> {
+    val patches = db.cacheDao().getAllSummariesByPrefix(CacheKeys.PREFIX_PATCH).mapNotNull { summary ->
+        val gameId = CacheKeys.parseGameIdFromPatchKey(summary.cacheKey)?.takeIf { it in gameIds }
+            ?: return@mapNotNull null
+        val user = CacheKeys.parseUserFromPatchKey(summary.cacheKey) ?: return@mapNotNull null
+        Triple(gameId, user, summary.sourceRomPath)
     }
+    val achievementSetsByGameAndUser = loadAchievementSetsHashes(
+        db,
+        patches.mapTo(HashSet()) { (gameId, user) -> gameId to user }
+    )
 
-    return patchEntries.mapNotNull { entry ->
-        val gameId = CacheKeys.parseGameIdFromPatchKey(entry.cacheKey) ?: return@mapNotNull null
-        val user = CacheKeys.parseUserFromPatchKey(entry.cacheKey) ?: return@mapNotNull null
+    return patches.map { (gameId, user, sourceRomPath) ->
         val endpointHash = achievementSetsByGameAndUser[gameId to user]
         CachedGameRefreshTarget(
             gameId = gameId,
             user = user,
-            sourceRomPath = entry.sourceRomPath,
+            sourceRomPath = sourceRomPath,
             endpoint = if (endpointHash != null) RefreshEndpoint.AchievementSets else RefreshEndpoint.Patch,
             romHash = endpointHash
         )
     }
+}
+
+private suspend fun loadAchievementSetsHashes(
+    db: AppDatabase,
+    wanted: Set<Pair<Int, String>>
+): Map<Pair<Int, String>, String> {
+    val found = HashMap<Pair<Int, String>, String>()
+    if (wanted.isEmpty()) return found
+    val wantedUsers = wanted.mapTo(HashSet()) { (_, user) -> user }
+    db.cacheDao().forEachEntryByPrefix(CacheKeys.PREFIX_ACHIEVEMENTSETS) { entry ->
+        val user = CacheKeys.parseUserFromAchievementSetsKey(entry.cacheKey)?.takeIf { it in wantedUsers }
+            ?: return@forEachEntryByPrefix
+        val hash = CacheKeys.parseAchievementSetsHash(entry.cacheKey) ?: return@forEachEntryByPrefix
+        val key = (achievementSetsGameId(entry) ?: return@forEachEntryByPrefix) to user
+        if (key in wanted) found.putIfAbsent(key, hash)
+        if (found.size == wanted.size) return found
+    }
+    return found
 }
 
 private fun achievementSetsGameId(entry: CacheEntry): Int? {
@@ -308,9 +333,9 @@ internal suspend fun deleteCachedGamesData(db: AppDatabase, gameIds: Set<String>
         dao.deleteByKeyPrefix(CacheKeys.startSessionPrefix(gameId))
         gameId.toIntOrNull()?.let { dao.deleteByKey(CacheKeys.lastPlayed(it)) }
     }
-    dao.getAllByPrefix(CacheKeys.PREFIX_ACHIEVEMENTSETS)
-        .filter { entry -> achievementSetsGameId(entry)?.toString() in gameIds }
-        .forEach { entry -> dao.deleteByKey(entry.cacheKey) }
+    dao.forEachEntryByPrefix(CacheKeys.PREFIX_ACHIEVEMENTSETS) { entry ->
+        if (achievementSetsGameId(entry)?.toString() in gameIds) dao.deleteByKey(entry.cacheKey)
+    }
 }
 
 internal suspend fun refreshCachedGameOfflineBundle(
@@ -420,7 +445,6 @@ suspend fun scanRomFolder(
     context: Context,
     treeUri: Uri,
     db: AppDatabase,
-    singleFile: Boolean = false,
     confirmLargeQueue: suspend (QueueEstimate) -> Boolean = { true },
     onQueued: (key: String) -> Unit = {},
     onProgress: (current: Int, total: Int, fileName: String) -> Unit
@@ -428,13 +452,9 @@ suspend fun scanRomFolder(
     val cachedGameIds = loadCachedGameIds(db)
     val cachedRomPaths = loadCachedRomPaths(db)
     val queuedRomPaths = CacheQueue.queuedRomPaths(db)
-    val files: List<DocumentFile> = if (singleFile) {
-        val f = DocumentFile.fromSingleUri(context, treeUri)
-        if (f != null && shouldScanFile(f)) listOf(f) else emptyList()
-    } else {
+    val files: List<DocumentFile> =
         DocumentFile.fromTreeUri(context, treeUri)?.let { collectScannableFiles(it, MAX_SCAN_ENTRIES) }
             ?: emptyList()
-    }
     val total = files.size
     val sourceRomPaths = files.map(::resolveDocumentAbsolutePath)
     val estimate = estimateQueueForPaths(db, sourceRomPaths, cachedRomPaths, queuedRomPaths)
@@ -459,11 +479,6 @@ suspend fun scanRomFolder(
         if (enqueueRomIfNeeded(db, candidates, cachedGameIds, sourceRomPath, file.name ?: "", onQueued)) queued++ else skipped++
     }
     return ScanResult(total = total, skipped = skipped, queued = queued)
-}
-
-internal suspend fun estimateQueueForDocuments(context: Context, db: AppDatabase, uris: List<Uri>): QueueEstimate {
-    val sourceRomPaths = uris.map { uri -> DocumentFile.fromSingleUri(context, uri)?.let(::resolveDocumentAbsolutePath) }
-    return estimateQueueForPaths(db, sourceRomPaths, loadCachedRomPaths(db), CacheQueue.queuedRomPaths(db))
 }
 
 internal suspend fun estimateQueueForPaths(
@@ -676,15 +691,15 @@ private suspend fun recordFailedAttempt(db: AppDatabase, rom: QueuedRom) {
 }
 
 internal suspend fun loadCachedGameIds(db: AppDatabase): MutableSet<String> =
-    db.cacheDao().getAllByPrefix(CacheKeys.PREFIX_PATCH)
-        .mapNotNull { entry -> CacheKeys.parseGameIdStringFromPatchKey(entry.cacheKey) }
+    db.cacheDao().getKeysByPrefix(CacheKeys.PREFIX_PATCH)
+        .mapNotNull { key -> CacheKeys.parseGameIdStringFromPatchKey(key) }
         .toMutableSet()
 
 internal fun String.normalizeCachedRomPath(): String =
     replace('\\', '/')
         .trim()
 
-private fun collectScannableFiles(root: DocumentFile, maxEntries: Int): List<DocumentFile> {
+internal fun collectScannableFiles(root: DocumentFile, maxEntries: Int): List<DocumentFile> {
     val result = mutableListOf<DocumentFile>()
     if (maxEntries <= 0) return result
     val stack = ArrayDeque<Pair<DocumentFile, Int>>()

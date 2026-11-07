@@ -44,12 +44,12 @@ Game badge and icon images are downloaded from RetroAchievements and stored in l
 
 ### Anonymous usage statistics
 
-On first start after setup, the app asks whether you want to share anonymous usage statistics. Nothing is collected or sent unless you agree, and you can turn it off at any time: in Settings on Android, or with "Disable usage stats" in the main menu of the Linux handheld app (this also deletes the statistics collected on your device since the last report).
+On first start after setup, the app asks whether you want to share anonymous usage statistics. Nothing is collected or sent unless you agree, and you can turn it off at any time: in Settings on Android or Windows, or with "Disable usage stats" in the main menu of the Linux handheld app (this also deletes the statistics collected on your device since the last report).
 
 If you opt in, the app sends one small report per day to a backend operated by the app developer (an AWS Lambda function storing into AWS DynamoDB, region eu-central-1). A report contains:
 
 - An anonymous ID, see below
-- App version, device model (for example "AYN Thor"), Android version and which emulators are enabled. On Linux handhelds: the firmware name and version (for example "ROCKNIX"), the device model and which emulators the proxy is set up for
+- App version, device model (for example "AYN Thor"), Android version and which emulators are enabled. On Linux handhelds: the firmware name and version (for example "ROCKNIX"), the device model and which emulators the proxy is set up for. On Windows: the Windows version (for example "Windows 11 24H2"), the PC or handheld model and which emulators the proxy is set up for
 - Rounded ranges of how many games are cached or queued, how old the oldest queued game is, and how many offline awards are pending (for example "100-249", never exact lists)
 - Counters since the last report: how many requests the app sent to RetroAchievements (split by emulator traffic, award sync, background caching and app actions), the busiest 30-minute window, and how many requests failed or were rate-limited, plus how many caching batches ran and how long they took
 
@@ -60,6 +60,8 @@ The report never contains your RetroAchievements username, password, token, game
 Your IP address is not stored or logged. Usage records are deleted automatically after about 13 months. Because they cannot be linked back to you, individual records cannot be looked up or deleted on request; turning the setting off stops all future reports.
 
 The statistics are used only to understand how many people use the app on which devices, whether features like bulk caching work, and how much load the app puts on RetroAchievements.
+
+Aggregated numbers from these statistics (for example how many people use the app per month, on which devices, and how many requests reach RetroAchievements per day) are published at [raofflineproxy.com/stats.html](https://raofflineproxy.com/stats.html) and updated daily. The page never shows individual reports or IDs. It lists the six most used devices and the six most used Android and firmware versions by name, even if only one person uses one of them; beyond those, a device or version used by only one person is shown as "Other".
 
 ### Donations
 

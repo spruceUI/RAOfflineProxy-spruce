@@ -13,7 +13,7 @@ The rest of this page explains the manual caching flow in the **Cached Games** s
 
 There is no limit on how many games you can cache.
 
-To go easy on the RetroAchievements servers, the **Add ROM**, **Scan ROM folder**, and **Smart Cache** actions cache up to **100 new games every 30 minutes**. Anything beyond that is queued and cached in the background during the next 30-minute windows, as long as the proxy is running and you are online. The queue is kept across restarts of the app and the device, and it waits while you are playing.
+To go easy on the RetroAchievements servers, the **Scan ROM folder** and **Smart Cache** actions, and watched folders, cache up to **100 new games every 30 minutes**. Anything beyond that is queued and cached in the background during the next 30-minute windows, as long as the proxy is running and you are online. The queue is kept across restarts of the app and the device, and it waits while you are playing.
 
 ## What Gets Cached
 
@@ -44,11 +44,16 @@ Smart Cache can use recent activity from:
 - **RetroArch** recent history
 - **Dolphin** recent GameCube and Wii save data
 - **PPSSPP** recent games list
+- **ARMSX1** (0.1.5 or newer) and **ARMSX2** (2.6.7 or newer) recently played list
 
 If Smart Cache does not find anything new, it simply finishes without adding more games.
 
-::: warning ARMSX1, ARMSX2, and Flycast are not Smart Cache sources
-**ARMSX1**, **ARMSX2**, and **Flycast** do not expose a recent-games list that the app can read. To cache games from these emulators, use **Scan ROM Folder** or **Add Individual ROM(s)** instead.
+::: info ARMSX1 and ARMSX2 ask for permission once
+The first time Smart Cache reads from ARMSX1 or ARMSX2, the emulator asks whether RAOfflineProxy may access its recently played games. Tap **Allow**. If you decline, Smart Cache skips that emulator until you turn sharing back on in the emulator's app settings.
+:::
+
+::: warning Flycast is not a Smart Cache source
+**Flycast** does not expose a recent-games list that the app can read. To cache Flycast games, use **Scan ROM Folder** instead.
 :::
 
 ### Scan ROM Folder
@@ -70,15 +75,21 @@ ROMs not recognized by RetroAchievements are skipped. Text files and hidden file
 Scanning the same folder again is quick: games that are already cached are skipped, and ROMs that RetroAchievements did not recognize are not looked up again for 7 days.
 :::
 
-### Add Individual ROM(s)
+### Watch ROM Folders
 
-1. Navigate to **Cached Games** → tap the **plus icon** (Add ROM)
-2. Pick one or more ROM files from the file picker
-3. Each selected file is identified and its game data is saved
+Every folder you scan is remembered. Switch watching on for a folder and new ROMs you copy into it are cached automatically, without scanning again.
 
-This is useful when you just want to cache one or two games without scanning an entire folder.
+1. Scan a ROM folder once (see above)
+2. On **Cached Games**, tap **y folders** in the header (for example `120 cached · 3 folders`)
+3. Tap the **eye icon** next to a folder to start watching it. A filled eye means the folder is watched
 
-If you pick more new games than can be cached right now, the rest is queued and cached in the background (see [Caching Pace](#caching-pace)).
+The dialog shows each folder with its path and when it was last checked. The **trash icon** removes a folder from the list. Cached games stay cached.
+
+A watched folder is checked **every 30 minutes**, and right away when you switch watching on. Only files the app has not handled before are identified, so each check is quick. New games go through the same queue as a manual scan, which means they are subject to the [caching pace](#caching-pace) of 100 new games every 30 minutes.
+
+::: tip
+Watching only runs while the proxy is running and you are online. It pauses while you are playing and during a manual scan, and picks up again afterwards.
+:::
 
 ## The Caching Process
 
@@ -104,12 +115,13 @@ The **Cached Games** screen shows a list of all games currently saved. For each 
 
 ## Refreshing Cache
 
-Tap the **refresh icon** to re-fetch data for all cached games while online. This updates achievement lists and your unlock counts.
+Cached games are kept up to date automatically:
 
-The proxy also runs an **automatic background refresh every 60 minutes** while the service is running and you are online. To keep the load on the RetroAchievements servers low, it only covers games you **played in the last 7 days**, and it waits until the proxy has been idle for 5 minutes, so it does not run while you are playing.
+- **Launching a game while online** fetches its latest achievements and unlocks.
+- The proxy runs an **automatic background refresh every 60 minutes** while the service is running and you are online. To keep the load on the RetroAchievements servers low, it only covers games you **played in the last 7 days**, and it waits until the proxy has been idle for 5 minutes, so it does not run while you are playing.
 
-::: tip Refresh before going offline
-Games you have not played recently are not refreshed in the background. If you unlocked achievements on another device, tap the **refresh icon** before you disconnect so your offline unlock state is current. Launching a game while online also fetches its latest unlocks.
+::: tip Before going offline with a game you have not played lately
+A game you have not launched recently keeps the data from when it was cached. If you unlocked achievements on another device, launch the game once while online before you disconnect, so your offline unlock state is current.
 :::
 
 ## Cache Expiration

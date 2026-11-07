@@ -1,21 +1,35 @@
 package com.raofflineproxy.ui
 
 import android.content.Context
+import android.content.SharedPreferences
+import androidx.core.content.edit
 import android.util.Log
 import com.raofflineproxy.PrefsConstants
-
-internal const val UI_PPSSPP_PACKAGE = "org.ppsspp.ppsspp"
-internal const val UI_PPSSPP_GOLD_PACKAGE = "org.ppsspp.ppssppgold"
-
-internal val UI_PPSSPP_PACKAGE_CANDIDATES = listOf(
-    UI_PPSSPP_PACKAGE,
-    UI_PPSSPP_GOLD_PACKAGE
-)
 
 internal fun resolveInstalledPackage(context: Context, packageCandidates: List<String>): String? =
     packageCandidates.firstOrNull { packageName ->
         runCatching { context.packageManager.getPackageInfo(packageName, 0) }.isSuccess
     }
+
+internal fun SharedPreferences.isPatchedThisRun(emulator: Emulator): Boolean =
+    getBoolean(emulator.patchedThisRunPrefsKey, false)
+
+internal fun SharedPreferences.hardcoreWasEnabled(emulator: Emulator): Boolean =
+    getBoolean(emulator.hardcoreWasEnabledPrefsKey, false)
+
+internal fun SharedPreferences.recordPatched(emulator: Emulator, hardcoreWasEnabled: Boolean) {
+    edit {
+        putBoolean(emulator.hardcoreWasEnabledPrefsKey, hardcoreWasEnabled)
+        putBoolean(emulator.patchedThisRunPrefsKey, true)
+    }
+}
+
+internal fun SharedPreferences.clearPatchState(emulator: Emulator) {
+    edit {
+        remove(emulator.hardcoreWasEnabledPrefsKey)
+        remove(emulator.patchedThisRunPrefsKey)
+    }
+}
 
 data class EmulatorState(
     val emulator: Emulator,
@@ -23,11 +37,12 @@ data class EmulatorState(
     val enabled: Boolean
 )
 
-data class EmulatorSupport(val states: List<EmulatorState>) {
+data class EmulatorSupport(val states: List<EmulatorState>, val argosyInstalled: Boolean = false) {
     val installed: List<Emulator> = states.filter { it.installed }.map { it.emulator }
     val enabled: List<Emulator> = states.filter { it.enabled }.map { it.emulator }
     val installedCount: Int = installed.size
     val hasAnyEnabled: Boolean = enabled.isNotEmpty()
+    val canStartProxy: Boolean = hasAnyEnabled || argosyInstalled
     val hasAnyShizukuManagedEnabled: Boolean = enabled.any { it in Emulator.SHIZUKU_MANAGED }
 
     fun isInstalled(emulator: Emulator): Boolean = emulator in installed
@@ -62,7 +77,8 @@ internal fun loadEmulatorSupport(context: Context): EmulatorSupport {
     val installedCount = installedPackages.size
 
     return EmulatorSupport(
-        Emulator.entries.map { emulator ->
+        argosyInstalled = isArgosyInstalled(context),
+        states = Emulator.entries.map { emulator ->
             val installed = installedPackages.containsKey(emulator)
             EmulatorState(
                 emulator = emulator,

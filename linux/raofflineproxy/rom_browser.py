@@ -3,10 +3,12 @@ from __future__ import annotations
 import enum
 import json
 import logging
+import shutil
 import tempfile
 import time
 import urllib.error
 import zipfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urljoin
@@ -14,9 +16,15 @@ from urllib.parse import urljoin
 from . import cache_budget, cache_keys, cache_queue, rate_limit, usage_stats
 from .auth import resolve_credentials
 from .cache_queue import QueuedRom
-from .config import FALLBACK_USER_AGENT, RA_MEDIA_HOST, image_caching_enabled, upstream_host
+from .config import (
+    FALLBACK_USER_AGENT,
+    RA_MEDIA_HOST,
+    ensure_config_dir,
+    image_caching_enabled,
+    upstream_host,
+)
+from .es_export import collect_cached_game_ids
 from .image_cache import (
-    STATIC_DIR,
     clear_all_cached_images,
     delete_cached_images_for_game,
     download_static_image,
@@ -26,14 +34,15 @@ from .image_cache import (
     resolve_cached_static_asset,
     schedule_image_download,
 )
-from .network import apply_scan_batch_cooldown, build_api_url, http_get
+from .network import build_api_url, http_get
 from .rom_cache import (
     CacheGameAuthError,
-    build_achievement_game_ids,
     cache_game,
     filter_warning_achievement_ids,
+    find_achievement_game_ids,
     merge_start_session_unlock_ids,
     merged_unlock_ids as merged_unlock_ids_for_user,
+    pending_unlock_achievement_ids,
 )
 from .rom_hashing import (
     hash_7z_entry_candidates,
@@ -55,6 +64,7 @@ ZIP_READABLE_ARCHIVE_EXTENSIONS = {".zip"}
 EXCLUDED_BROWSER_DIR_NAMES = {"Imgs"}
 MAX_SCAN_ENTRIES = 5000
 MAX_SCAN_DEPTH = 12
+PACE_POLL_SECONDS = 1.0
 # RetroAchievements adds hashes over time, so a "no match" is only cached long enough to
 # stop a repeated scan of the same folder from re-querying every unsupported ROM.
 GAMEID_MISS_TTL_MS = 7 * 24 * 60 * 60 * 1000
@@ -133,52 +143,46 @@ def normalize_cached_rom_path(path: str | Path) -> str:
 def load_cached_rom_paths(storage: Storage) -> set[str]:
     return {
         normalize_cached_rom_path(entry["sourceRomPath"])
-        for entry in storage.get_all_cache_by_prefix(cache_keys.PREFIX_PATCH)
+        for entry in storage.cache_summaries_by_prefix(cache_keys.PREFIX_PATCH)
         if isinstance(entry.get("sourceRomPath"), str)
         and entry["sourceRomPath"].strip()
     }
 
 
+def cached_rom_paths_by_game(storage: Storage) -> dict[int, str]:
+    """The ROM each cached game was cached from, as "/<system folder>/<file>": the part that
+    stays the same when the card is mounted elsewhere or moves to another device. With several
+    entries for one game (one per account), the most recently cached one wins."""
+    latest: dict[int, tuple[int, str]] = {}
+    for entry in storage.cache_summaries_by_prefix(cache_keys.PREFIX_PATCH):
+        game_id = cache_keys.parse_game_id_from_patch_key(str(entry.get("cacheKey", "")))
+        path = entry.get("sourceRomPath")
+        if game_id is None or not isinstance(path, str) or not path.strip():
+            continue
+        cached_at = int(entry.get("cachedAt") or 0)
+        if game_id not in latest or cached_at > latest[game_id][0]:
+            latest[game_id] = (cached_at, normalize_cached_rom_path(path))
+    return {game_id: path for game_id, (_cached_at, path) in latest.items()}
+
+
 def list_cached_games(storage: Storage) -> list[CachedGameEntry]:
-    games: dict[int, CachedGameEntry] = {}
-    for entry in storage.get_all_cache_by_prefix(cache_keys.PREFIX_PATCH):
-        game_id = cache_keys.parse_game_id_from_patch_key(entry["cacheKey"])
-        if game_id is None:
-            continue
-        try:
-            payload = json.loads(entry["responseBody"])
-        except Exception:
-            continue
-
-        patch_data = payload.get("PatchData") or {}
-        title = patch_data.get("Title") or f"Game {game_id}"
-        image_path = patch_data.get("ImageIcon") or patch_data.get("ImageBoxArt")
-        games[game_id] = CachedGameEntry(
-            game_id=game_id,
-            title=title,
-            image_url=normalize_preview_url(image_path),
-        )
-
-    for entry in storage.get_all_cache_by_prefix(cache_keys.PREFIX_ACHIEVEMENTSETS):
-        try:
-            payload = json.loads(entry["responseBody"])
-        except Exception:
-            continue
-
-        game_id = payload.get("GameId")
-        if not isinstance(game_id, int) or game_id <= 0:
-            continue
-
-        title = payload.get("Title") or f"Game {game_id}"
-        image_path = payload.get("ImageIcon") or payload.get("ImageIconUrl")
-        if game_id not in games:
-            games[game_id] = CachedGameEntry(
-                game_id=game_id,
-                title=title,
-                image_url=normalize_preview_url(image_path),
-            )
-
+    games = cached_games_from_meta(storage.cached_game_meta())
     return sorted(games.values(), key=lambda game: game.title.lower())
+
+
+def cached_games_from_meta(metas: list[dict]) -> dict[int, CachedGameEntry]:
+    """A game's patch names it; its achievementsets only name games cached without a patch."""
+    games: dict[int, CachedGameEntry] = {}
+    for meta in sorted(metas, key=lambda meta: not meta["cacheKey"].startswith(cache_keys.PREFIX_PATCH)):
+        games.setdefault(
+            int(meta["gameId"]),
+            CachedGameEntry(
+                game_id=int(meta["gameId"]),
+                title=meta["title"] or f"Game {meta['gameId']}",
+                image_url=normalize_preview_url(meta["imagePath"]),
+            ),
+        )
+    return games
 
 
 def list_browser_entries(current_dir: Path) -> list[Path]:
@@ -262,7 +266,7 @@ def list_scannable_files_recursive(root: Path) -> list[Path]:
 
 
 def describe_browser_entries(current_dir: Path, storage: Storage) -> list[BrowserEntry]:
-    cached_game_ids = {game.game_id for game in list_cached_games(storage)}
+    cached_game_ids = collect_cached_game_ids(storage)
     entries: list[BrowserEntry] = []
     for path in list_browser_entries(current_dir):
         entries.append(
@@ -281,7 +285,7 @@ def browser_file_is_cached(
     path: Path, storage: Storage, cached_game_ids: set[int] | None = None
 ) -> bool:
     if cached_game_ids is None:
-        cached_game_ids = {game.game_id for game in list_cached_games(storage)}
+        cached_game_ids = collect_cached_game_ids(storage)
 
     try:
         hash_candidates = hash_candidates_for_manual_cache(path)
@@ -437,16 +441,15 @@ def hash_candidates_for_manual_cache(path: Path) -> list[str]:
     # Exactly one inner console ROM: hash its extracted content.
     if len(rom_entries) == 1:
         rom_entry = rom_entries[0]
-        with zipfile.ZipFile(path) as archive:
-            with archive.open(rom_entry) as source:
-                rom_bytes = source.read()
-
         suffix = Path(rom_entry.filename).suffix
         entry_name = Path(rom_entry.filename).stem
-        with tempfile.TemporaryDirectory() as temp_dir:
+        # /tmp is RAM-backed on handhelds: stream the entry to the data dir instead.
+        with tempfile.TemporaryDirectory(prefix="rom-hash-", dir=ensure_config_dir()) as temp_dir:
             temp_name = entry_name if suffix else Path(rom_entry.filename).name
             temp_path = Path(temp_dir) / f"{temp_name}{suffix}"
-            temp_path.write_bytes(rom_bytes)
+            with zipfile.ZipFile(path) as archive:
+                with archive.open(rom_entry) as source, temp_path.open("wb") as target:
+                    shutil.copyfileobj(source, target, length=64 * 1024)
             if temp_path.suffix.lower() == ".chd":
                 result = hash_rom_candidates_result(temp_path)
                 if result.error is not None:
@@ -593,10 +596,15 @@ def format_clock_time(millis: int) -> str:
 
 
 def find_cached_game(storage: Storage, game_id: int) -> CachedGameEntry | None:
-    return next(
-        (entry for entry in list_cached_games(storage) if entry.game_id == game_id),
-        None,
-    )
+    return cached_games_from_meta(storage.cached_game_meta(game_id)).get(game_id)
+
+
+def achievementsets_keys_for_game(storage: Storage, game_id: int) -> list[str]:
+    return [
+        meta["cacheKey"]
+        for meta in storage.cached_game_meta(game_id)
+        if meta["cacheKey"].startswith(cache_keys.PREFIX_ACHIEVEMENTSETS)
+    ]
 
 
 def already_cached_result(storage: Storage, game_id: int) -> AddRomResult:
@@ -674,22 +682,26 @@ def drain_cache_queue(
 ) -> DrainResult:
     """The single place that sends RA requests for bulk caching: works through the queue oldest
     first (or through keys, in order) within the caching budget. A window allows
-    CACHE_BUDGET_LIMIT cached games; ROMs RetroAchievements doesn't know don't count. A batch ends
+    CACHE_BUDGET_LIMIT cached games; ROMs RetroAchievements doesn't know don't count. After the
+    first CACHE_BURST_GAMES of a window, ROMs that need RetroAchievements start
+    CACHE_PACE_SECONDS apart, so the rest of the budget is spread over the window; the lock is
+    free while it waits. A batch ends
     after CACHE_BATCH_MAX_MS at the latest and leaves the rest for the next window. A 429 stops
     the queue for at least RATE_LIMIT_PAUSE_MS. Only one caller drains at a time; without
     wait_for_lock a concurrent call returns BUSY at once. A failed ROM keeps its place and is
     retried on a later round instead of back to back. on_item reports progress in games within
     the current window."""
     pause = should_pause or (lambda: False)
-    with cache_queue.drain_lock.hold(blocking=wait_for_lock, should_abort=pause) as acquired:
-        if not acquired:
+    with cache_queue.drain_lock.hold(blocking=wait_for_lock, should_abort=pause) as lock:
+        if not lock:
             return DrainResult(0, 0, DrainStop.BUSY)
-        with rate_limit.background():
+        with cache_queue.draining_lock.hold(shared=True), rate_limit.background():
             return _drain_locked(
                 storage,
                 config_data,
                 credentials,
                 user_agent,
+                lock,
                 pause,
                 None if keys is None else list(dict.fromkeys(keys)),
                 on_item,
@@ -697,11 +709,31 @@ def drain_cache_queue(
             )
 
 
+def past_burst(storage: Storage, requested: int) -> bool:
+    """Lookups for ROMs RetroAchievements doesn't know never fill the budget, so a drain's own
+    requests count as well."""
+    burst = cache_budget.CACHE_BURST_GAMES
+    return requested >= burst or cache_budget.used(storage) >= burst
+
+
+def wait_for_pace(ready_at: float, should_pause) -> bool:
+    """Waits until the monotonic clock reaches ready_at; False when should_pause asks to stop
+    first, so a paused drain lets a game cached by hand go ahead within a second."""
+    while True:
+        if should_pause():
+            return False
+        left = ready_at - time.monotonic()
+        if left <= 0:
+            return True
+        time.sleep(min(PACE_POLL_SECONDS, left))
+
+
 def _drain_locked(
     storage: Storage,
     config_data: dict,
     credentials: dict,
     user_agent: str,
+    lock,
     should_pause,
     pending_keys: list[str] | None,
     on_item,
@@ -710,6 +742,8 @@ def _drain_locked(
     cached = 0
     no_match = 0
     requested = 0
+    next_request_at = 0.0
+    paced = False
     started_at = current_millis()
     stop_at = started_at + cache_budget.CACHE_BATCH_MAX_MS
     known_game_ids = cached_game_ids(storage)
@@ -752,10 +786,12 @@ def _drain_locked(
         if stopped is not None:
             return stopped
         if current_millis() >= stop_at:
-            window_end = cache_budget.window_ends_at(storage)
-            cache_budget.pause_until(storage, window_end)
-            LOGGER.info("Cache queue: batch time limit reached, rest waits for the next window")
-            return result(DrainStop.BUDGET_EXHAUSTED, window_end, time_limited=True)
+            LOGGER.info("Cache queue: batch time limit reached")
+            return result(
+                DrainStop.BUDGET_EXHAUSTED,
+                cache_budget.next_available_at(storage),
+                time_limited=True,
+            )
         rom = next_rom()
         if rom is None:
             return result(DrainStop.EMPTY)
@@ -775,7 +811,18 @@ def _drain_locked(
         games_left = cache_budget.remaining(storage)
         if games_left == 0:
             return result(DrainStop.BUDGET_EXHAUSTED, cache_budget.next_available_at(storage))
-        apply_scan_batch_cooldown(requested)
+        if requested > 0 and not paced and past_burst(storage, requested):
+            # Another caller, e.g. a game cached by hand, may drain while this one waits, so
+            # everything is checked again afterwards.
+            with lock.released(should_pause):
+                ready = wait_for_pace(next_request_at, should_pause)
+            if not ready or not lock:
+                return result(DrainStop.PAUSED)
+            known_game_ids.update(cached_game_ids(storage))
+            paced = True
+            continue
+        paced = False
+        next_request_at = time.monotonic() + cache_budget.CACHE_PACE_SECONDS
         if on_item is not None:
             queued = len(pending_keys) if pending_keys is not None else cache_queue.count(storage)
             on_item(cached + 1, window_progress_total(cached, queued, games_left), rom.label)
@@ -856,16 +903,18 @@ def cache_queued_rom(
                 storage,
                 config_data,
                 cache_images=image_caching_enabled(config_data),
+                source_rom_path=rom.source_rom_path,
             )
     except CacheGameAuthError as exc:
         return QueuedRomOutcome.AUTH_REJECTED, game_id, f"Caching failed: {exc}"
     except Exception as exc:
         return QueuedRomOutcome.FAILED, game_id, f"Caching failed: {exc}"
 
-    remember_source_rom_path(storage, game_id, credentials["user"], rom.source_rom_path)
     patch_entry = storage.get_cache(cache_keys.patch(game_id, credentials["user"]))
     if patch_entry is None:
         return QueuedRomOutcome.FAILED, game_id, "Caching failed: patch data was not stored"
+    if rom.source_rom_path and patch_entry.get("sourceRomPath") != rom.source_rom_path:
+        remember_source_rom_path(storage, game_id, credentials["user"], rom.source_rom_path)
     if not image_caching_enabled(config_data):
         cache_game_icon(game_id, patch_entry["responseBody"], proxy_user_agent(user_agent))
     return QueuedRomOutcome.CACHED, game_id, ""
@@ -941,22 +990,12 @@ def remove_cached_game(storage: Storage, game_id: int) -> None:
 
 
 def remove_achievementsets_for_game(storage: Storage, game_id: int) -> None:
-    for entry in storage.get_all_cache_by_prefix(cache_keys.PREFIX_ACHIEVEMENTSETS):
-        try:
-            payload = json.loads(entry["responseBody"])
-        except Exception:
-            continue
-
-        if payload.get("GameId") != game_id:
-            continue
-
-        cache_key = entry.get("cacheKey")
-        if isinstance(cache_key, str) and cache_key:
-            storage.delete_cache(cache_key)
+    for cache_key in achievementsets_keys_for_game(storage, game_id):
+        storage.delete_cache(cache_key)
 
 
 def remove_gameid_aliases_for_game(storage: Storage, game_id: int) -> None:
-    for entry in storage.get_all_cache_by_prefix(cache_keys.PREFIX_GAMEID):
+    for entry in storage.iter_cache_by_prefix(cache_keys.PREFIX_GAMEID):
         try:
             payload = json.loads(entry["responseBody"])
         except Exception:
@@ -978,14 +1017,13 @@ def cached_unlock_count(storage: Storage, game_id: int) -> int | None:
 
 
 def cached_unlock_counts(storage: Storage) -> dict[int, int]:
-    achievement_game_ids = build_achievement_game_ids(
-        storage.get_all_cache_by_prefix(cache_keys.PREFIX_PATCH),
-        storage.get_all_cache_by_prefix(cache_keys.PREFIX_ACHIEVEMENTSETS),
-    )
     pending_awards = storage.get_pending_awards()
+    achievement_game_ids = find_achievement_game_ids(
+        storage, pending_unlock_achievement_ids(pending_awards)
+    )
     counts: dict[int, int] = {}
 
-    for entry in storage.get_all_cache_by_prefix(cache_keys.PREFIX_UNLOCKS):
+    for entry in storage.iter_cache_by_prefix(cache_keys.PREFIX_UNLOCKS):
         game_id = parse_game_id_from_unlock_key(entry.get("cacheKey", ""))
         user = parse_user_from_unlocks_key(entry.get("cacheKey", ""))
         if game_id is None or user is None:
@@ -1009,7 +1047,7 @@ def cached_unlock_counts(storage: Storage) -> dict[int, int]:
         )
         counts[game_id] = len(merged_ids)
 
-    for entry in storage.get_all_cache_by_prefix(cache_keys.PREFIX_STARTSESSION):
+    for entry in storage.iter_cache_by_prefix(cache_keys.PREFIX_STARTSESSION):
         game_id = parse_game_id_from_start_session_key(entry.get("cacheKey", ""))
         user = parse_user_from_start_session_key(entry.get("cacheKey", ""))
         if game_id is None or user is None or game_id in counts:
@@ -1061,9 +1099,7 @@ def cached_unlock_titles(storage: Storage, game_id: int) -> list[str]:
 def merged_unlock_ids(storage: Storage, game_id: int) -> list[int] | None:
     cached_unlock_ids: list[int] | None = None
     unlock_user: str | None = None
-    for entry in storage.get_all_cache_by_prefix(
-        f"{cache_keys.PREFIX_UNLOCKS}{game_id}:"
-    ):
+    for entry in storage.iter_cache_by_prefix(f"{cache_keys.PREFIX_UNLOCKS}{game_id}:"):
         try:
             payload = json.loads(entry["responseBody"])
         except Exception:
@@ -1103,14 +1139,15 @@ def merged_unlock_ids(storage: Storage, game_id: int) -> list[int] | None:
             if isinstance(item, dict) and int(item.get("ID", 0) or 0) > 0
         ])
 
-    achievement_game_ids = build_achievement_game_ids(
-        storage.get_all_cache_by_prefix(cache_keys.PREFIX_PATCH),
-        storage.get_all_cache_by_prefix(cache_keys.PREFIX_ACHIEVEMENTSETS),
-    )
+    pending_awards = storage.get_pending_awards()
     return merge_start_session_unlock_ids(
         cached_unlock_ids=cached_unlock_ids or [],
-        pending_awards=storage.get_pending_awards(),
-        achievement_game_ids=achievement_game_ids,
+        pending_awards=pending_awards,
+        achievement_game_ids=find_achievement_game_ids(
+            storage,
+            pending_unlock_achievement_ids(pending_awards, unlock_user),
+            likely_game_id=game_id,
+        ),
         game_id=game_id,
         user=unlock_user,
     )
@@ -1175,8 +1212,8 @@ def cached_unlock_badge_paths(storage: Storage, game_id: int) -> dict[str, Path]
         badge_name = achievement.get("BadgeName")
         if not isinstance(badge_name, str) or not badge_name:
             continue
-        badge_path = STATIC_DIR / "Badge" / f"{badge_name}.png"
-        if badge_path.exists():
+        badge_path = resolve_cached_static_asset(f"/Badge/{badge_name}.png")
+        if badge_path is not None:
             result[title] = badge_path
     return result
 
@@ -1185,19 +1222,23 @@ def cached_achievements_by_id(storage: Storage, game_id: int) -> dict[int, dict]
     achievements_by_id: dict[int, dict] = {}
     merge_cached_achievement_entries(
         achievements_by_id,
-        storage.get_all_cache_by_prefix(cache_keys.patch_prefix(game_id)),
+        storage.iter_cache_by_prefix(cache_keys.patch_prefix(game_id)),
         lambda payload: payload.get("PatchData", {}).get("Achievements"),
     )
     merge_cached_achievement_entries(
         achievements_by_id,
-        storage.get_all_cache_by_prefix(cache_keys.PREFIX_ACHIEVEMENTSETS),
+        (
+            entry
+            for entry in map(storage.get_cache, achievementsets_keys_for_game(storage, game_id))
+            if entry is not None
+        ),
         lambda payload: achievementsets_payload_achievements(payload, game_id),
     )
     return achievements_by_id
 
 
 def merge_cached_achievement_entries(
-    achievements_by_id: dict[int, dict], entries: list[dict], select_achievements
+    achievements_by_id: dict[int, dict], entries: Iterable[dict], select_achievements
 ) -> None:
     for entry in entries:
         try:

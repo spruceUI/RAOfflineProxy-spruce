@@ -3,7 +3,12 @@ import * as cdk from 'aws-cdk-lib';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as logs from 'aws-cdk-lib/aws-logs';
+import * as ssm from 'aws-cdk-lib/aws-ssm';
+import * as budgets from 'aws-cdk-lib/aws-budgets';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as eventsTargets from 'aws-cdk-lib/aws-events-targets';
 import * as apigwv2 from 'aws-cdk-lib/aws-apigatewayv2';
 import * as apigwv2_integrations from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 import { Construct } from 'constructs';
@@ -219,7 +224,105 @@ export class RaopSupportLogsStack extends cdk.Stack {
             ),
             environment: { TABLE_NAME: usageTable.tableName },
             timeout: cdk.Duration.seconds(10),
-            memorySize: 256
+            memorySize: 256,
+            logRetention: logs.RetentionDays.ONE_MONTH
+        });
+
+        // Bakes the aggregated usage stats into raofflineproxy.com/stats.html once a day. The site
+        // bucket belongs to the docs deploy (deploy-docs.yml), which excludes stats.html from its
+        // --delete sync; this role may only write that one object.
+        const SITE_BUCKET_NAME = 'ra-offline-proxy-web';
+        const STATS_PAGE_KEY = 'stats.html';
+
+        const statsPageRole = new iam.Role(this, 'UsageStatsPageLambdaRole', {
+            roleName: 'raop-usage-stats-page-lambda-role',
+            assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+            managedPolicies: [
+                iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')
+            ],
+            inlinePolicies: {
+                StatsPagePublishPolicy: new iam.PolicyDocument({
+                    statements: [
+                        new iam.PolicyStatement({
+                            actions: ['s3:PutObject'],
+                            resources: [`arn:aws:s3:::${SITE_BUCKET_NAME}/${STATS_PAGE_KEY}`]
+                        })
+                    ]
+                })
+            }
+        });
+        usageTable.grant(statsPageRole, 'dynamodb:Scan');
+
+        const statsPageFn = new lambda.Function(this, 'UsageStatsPageFn', {
+            functionName: 'raop-usage-stats-page',
+            runtime: lambda.Runtime.NODEJS_24_X,
+            handler: 'index.handler',
+            role: statsPageRole,
+            code: lambda.Code.fromAsset(
+                path.join(LAMBDA_DIR, 'raop-usage-stats-page', 'dist', 'raop-usage-stats-page.zip')
+            ),
+            environment: {
+                TABLE_NAME: usageTable.tableName,
+                SITE_BUCKET: SITE_BUCKET_NAME,
+                PAGE_KEY: STATS_PAGE_KEY
+            },
+            timeout: cdk.Duration.seconds(60),
+            memorySize: 512,
+            logRetention: logs.RetentionDays.ONE_MONTH
+        });
+
+        new events.Rule(this, 'UsageStatsPageSchedule', {
+            ruleName: 'raop-usage-stats-page-daily',
+            description: 'Rebuild raofflineproxy.com/stats.html at the end of each UTC day',
+            schedule: events.Schedule.cron({ minute: '55', hour: '23' }),
+            targets: [new eventsTargets.LambdaFunction(statsPageFn)]
+        });
+
+        // The whole account normally costs cents; anything near this means abuse (e.g. a flood of the
+        // public /usage/ping or support routes) or a misconfiguration. Budgets only warns, it never
+        // stops anything.
+        const MONTHLY_BUDGET_USD = 5;
+        // The recipient lives in SSM (create it once, outside this public repo); CloudFormation
+        // resolves it at deploy time, so the address appears neither in code nor in the template.
+        const BUDGET_ALERT_EMAIL_PARAM = '/raop/budget/alert-email';
+        const budgetAlertEmail = ssm.StringParameter.valueForStringParameter(this, BUDGET_ALERT_EMAIL_PARAM);
+        const budgetSubscribers = [{ subscriptionType: 'EMAIL', address: budgetAlertEmail }];
+        new budgets.CfnBudget(this, 'MonthlyCostBudget', {
+            budget: {
+                budgetName: 'raop-monthly-cost',
+                budgetType: 'COST',
+                timeUnit: 'MONTHLY',
+                budgetLimit: { amount: MONTHLY_BUDGET_USD, unit: 'USD' }
+            },
+            notificationsWithSubscribers: [
+                {
+                    notification: {
+                        notificationType: 'ACTUAL',
+                        comparisonOperator: 'GREATER_THAN',
+                        threshold: 80,
+                        thresholdType: 'PERCENTAGE'
+                    },
+                    subscribers: budgetSubscribers
+                },
+                {
+                    notification: {
+                        notificationType: 'ACTUAL',
+                        comparisonOperator: 'GREATER_THAN',
+                        threshold: 100,
+                        thresholdType: 'PERCENTAGE'
+                    },
+                    subscribers: budgetSubscribers
+                },
+                {
+                    notification: {
+                        notificationType: 'FORECASTED',
+                        comparisonOperator: 'GREATER_THAN',
+                        threshold: 100,
+                        thresholdType: 'PERCENTAGE'
+                    },
+                    subscribers: budgetSubscribers
+                }
+            ]
         });
 
         // Throttle the whole API (both routes) so a scripted flood of /support/submit can't

@@ -34,6 +34,7 @@ import com.raofflineproxy.data.CacheKeys
 import com.raofflineproxy.proxyUserAgent
 import com.raofflineproxy.proxy.AwardFlusher
 import com.raofflineproxy.proxy.CacheQueue
+import com.raofflineproxy.proxy.WatchFolders
 import com.raofflineproxy.proxy.RateLimitBackoff
 import com.raofflineproxy.proxy.GameActivity
 import com.raofflineproxy.proxy.ProxyServer
@@ -44,8 +45,10 @@ import com.raofflineproxy.proxy.loadUserAgent
 import com.raofflineproxy.proxy.refreshCachedGameOfflineBundle
 import com.raofflineproxy.proxy.RefreshNotificationMode
 import com.raofflineproxy.proxy.DrainStop
+import com.raofflineproxy.update.AppUpdateNotifier
 import com.raofflineproxy.usage.UsageReporter
 import com.raofflineproxy.proxy.drainCacheQueue
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -84,9 +87,11 @@ class ProxyService : Service() {
     private lateinit var connectivityManager: ConnectivityManager
 
     private var hasInternet = false
+    @Volatile private var listening = false
     private var networkCallbackRegistered = false
     private var refreshJob: Job? = null
     private var cacheQueueJob: Job? = null
+    private var folderWatchJob: Job? = null
     private var cacheQueueRejectedToken: String? = null
     @Volatile private var queueLoginBlocked = false
         set(value) {
@@ -155,10 +160,10 @@ class ProxyService : Service() {
 
         cancelRestart(this)
         createNotificationChannel()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIFICATION_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
-            startForeground(NOTIFICATION_ID, buildNotification())
+        if (!enterForeground()) {
+            setShouldKeepRunning(this, false)
+            stopSelf()
+            return START_NOT_STICKY
         }
 
         refreshReachability(forceProbe = true)
@@ -181,6 +186,8 @@ class ProxyService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        listening = true
+        publishRuntime()
 
         if (isServerReachable()) {
             requestFlush()
@@ -192,6 +199,10 @@ class ProxyService : Service() {
 
         if (cacheQueueJob?.isActive != true) {
             cacheQueueJob = serviceScope.launch { cacheQueueLoop() }
+        }
+
+        if (folderWatchJob?.isActive != true) {
+            folderWatchJob = serviceScope.launch { folderWatchLoop() }
         }
 
         CachingNotifications.clearStandalone(this)
@@ -223,6 +234,26 @@ class ProxyService : Service() {
         }
 
         return START_STICKY
+    }
+
+    private fun enterForeground(): Boolean {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(NOTIFICATION_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(NOTIFICATION_ID, buildNotification())
+            }
+        } catch (error: IllegalStateException) {
+            if (!isForegroundServiceStartBlocked(error)) throw error
+            Log.w(TAG, "Android refused to run the proxy in the foreground; stopping", error)
+            return false
+        }
+        // With battery usage restricted, Android may ignore startForeground() without throwing.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && foregroundServiceType == ServiceInfo.FOREGROUND_SERVICE_TYPE_NONE) {
+            Log.w(TAG, "Android ignored the request to run the proxy in the foreground; stopping")
+            return false
+        }
+        return true
     }
 
     private fun requestFlush() {
@@ -336,6 +367,48 @@ class ProxyService : Service() {
         return (resumeAt - System.currentTimeMillis()).coerceAtLeast(1_000L)
     }
 
+    private suspend fun folderWatchLoop() {
+        while (true) {
+            try {
+                watchFoldersOnce()
+            } catch (c: CancellationException) {
+                throw c
+            } catch (t: Throwable) {
+                Log.e(TAG, "Watched folder round failed", t)
+            }
+            withTimeoutOrNull(CACHE_QUEUE_POLL_MS.milliseconds) { folderWatchWake.receive() }
+        }
+    }
+
+    /** Hashes and queues what watched folders gained since their last scan; the cache queue
+     *  then caches it within the budget. Runs as a bulk run so the queue worker doesn't drain
+     *  while it is still filling, and stands down whenever a game is being played. */
+    private suspend fun watchFoldersOnce() {
+        val folders = WatchFolders.due(db, System.currentTimeMillis())
+        if (folders.isEmpty() || !canWatchFolders()) return
+        val credentials = loadLoginCredentials(db) ?: return
+        if (credentials.token == cacheQueueRejectedToken) return
+        FolderWatchWakeLock.hold(this)
+        try {
+            CacheQueue.duringBulkRun {
+                for (folder in folders) {
+                    if (!canWatchFolders(ignoreBulkRun = true)) break
+                    val scan = WatchFolders.scan(this, db, folder, shouldAbort = { !canWatchFolders(ignoreBulkRun = true) })
+                    Log.i(
+                        TAG,
+                        "Watched folder ${folder.name}: " + (scan?.let { "${it.files} file(s), ${it.new} new, ${it.queued} queued" } ?: "unreadable")
+                    )
+                }
+            }
+        } finally {
+            FolderWatchWakeLock.release()
+            wakeCacheQueue()
+        }
+    }
+
+    private fun canWatchFolders(ignoreBulkRun: Boolean = false): Boolean =
+        (ignoreBulkRun || !CacheQueue.bulkRunActive) && isServerReachable() && onlineRefreshIdleDelayMs() <= 0
+
     private fun canWorkOnCacheQueue(): Boolean =
         !CacheQueue.bulkRunActive && isServerReachable() && onlineRefreshIdleDelayMs() <= 0
 
@@ -344,6 +417,7 @@ class ProxyService : Service() {
             delay(REFRESH_INTERVAL_MS.milliseconds)
             if (!isServerReachable()) continue
             UsageReporter.reportIfDue(this, db)
+            AppUpdateNotifier.notifyIfDue(this, connectivityManager)
             RateLimitBackoff.pausedUntil()?.let { until ->
                 Log.i(TAG, "Periodic refresh skipped; RetroAchievements rate-limited us until ${java.text.DateFormat.getTimeInstance().format(java.util.Date(until))}")
                 continue
@@ -361,13 +435,13 @@ class ProxyService : Service() {
                 continue
             }
             val userAgent = loadUserAgent(db)
-            val refreshTargets = loadCachedGameRefreshTargets(db)
             val playedSince = System.currentTimeMillis() - REFRESH_PLAYED_WINDOW_MS
             val recentlyPlayed = loadRecentlyPlayedGameIds(db, playedSince)
-            val dueTargets = refreshTargets.filter { target -> target.gameId in recentlyPlayed }
+            val dueTargets = loadCachedGameRefreshTargets(db, recentlyPlayed)
+            val cachedGameCount = db.cacheDao().countByPrefix(CacheKeys.PREFIX_PATCH)
             Log.i(
                 TAG,
-                "Periodic refresh: ${dueTargets.size} of ${refreshTargets.size} cached game(s) " +
+                "Periodic refresh: ${dueTargets.size} of $cachedGameCount cached game(s) " +
                     "played in the last $REFRESH_PLAYED_WINDOW_DAYS day(s)"
             )
             RateLimitBackoff.background {
@@ -417,6 +491,7 @@ class ProxyService : Service() {
         }
         CacheQueueAlarm.cancel(this)
         CacheQueueWakeLock.release()
+        FolderWatchWakeLock.release()
         proxyServer.stop()
         if (networkCallbackRegistered) {
             runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
@@ -511,7 +586,7 @@ class ProxyService : Service() {
     // Runs on worker threads too: the lock keeps a late publish from undoing onDestroy's reset.
     private fun publishRuntime() = synchronized(runtimeLock) {
         if (!runningInProcess) return
-        _runtime.value = ServiceRuntime(running = true, online = isServerReachable(), queueLoginBlocked = queueLoginBlocked)
+        _runtime.value = ServiceRuntime(running = listening, online = isServerReachable(), queueLoginBlocked = queueLoginBlocked)
     }
 
     private fun onGameActivity(activity: GameActivity) {
@@ -598,6 +673,7 @@ class ProxyService : Service() {
 
         if (!validated) {
             markRetroAchievementsUnreachable()
+            AwardFlusher.clearSyncError()
         } else {
             val effectiveWasReachable = if (forceProbe) {
                 markRetroAchievementsUnreachable()
@@ -618,6 +694,7 @@ class ProxyService : Service() {
                     wakeCacheQueue()
                 } else if (!isReachableNow && effectiveWasReachable) {
                     Log.i(TAG, "RetroAchievements unreachable")
+                    AwardFlusher.clearSyncError()
                     if (recentGameId != null) {
                         scheduleOfflineIdleTimeout(currentOfflineActivityAt())
                     }
@@ -652,6 +729,7 @@ class ProxyService : Service() {
         @Volatile
         private var runningInProcess = false
         private val cacheQueueWake = Channel<Unit>(Channel.CONFLATED)
+        private val folderWatchWake = Channel<Unit>(Channel.CONFLATED)
         private val runtimeLock = Any()
         private val _runtime = MutableStateFlow(ServiceRuntime())
 
@@ -660,8 +738,16 @@ class ProxyService : Service() {
 
         fun isRunningInProcess(): Boolean = runningInProcess
 
+        /** Whether the proxy accepts connections, unlike [isRunning], which is also true while
+         *  the service is still starting. */
+        fun isListening(): Boolean = _runtime.value.running
+
         fun wakeCacheQueue() {
             cacheQueueWake.trySend(Unit)
+        }
+
+        fun wakeFolderWatch() {
+            folderWatchWake.trySend(Unit)
         }
 
         private fun restartPendingIntent(context: Context): PendingIntent = PendingIntent.getBroadcast(

@@ -1,6 +1,6 @@
 # Installation & Setup (Android)
 
-> You are installing the current alpha build: `v2.0.0-alpha1`.
+> You are installing the current alpha build: `v2.3.0-alpha1`.
 
 ## Prerequisites
 
@@ -32,9 +32,7 @@ You can cache games in either of these ways:
 
 1. **Cache them manually from RAOfflineProxy**
    - Navigate to **Cached Games** in the drawer
-   - Choose one of:
-     - **Scan ROM folder**: picks a folder and scans all ROMs in it
-     - **Add ROM**: picks individual ROM file(s)
+   - Tap **Scan ROM folder** to pick a folder and scan all ROMs in it
 
 2. **Cache them automatically by launching them in a supported emulator**
    - Keep the proxy running while you are online

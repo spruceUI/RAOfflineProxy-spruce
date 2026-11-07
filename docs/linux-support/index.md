@@ -17,7 +17,7 @@ The Linux version is for handheld Linux devices where you want the same basic of
 - Onion
 - muOS
 - ROCKNIX
-- spruce (experimental)
+- spruce (built into spruceOS 4.5.0+)
 - Allium (experimental)
 - dArkOS (experimental)
 
@@ -41,6 +41,8 @@ It is currently compatible with [MustardOS 2601.1 Funky Jacaranda](https://muos.
 
 The muOS target ships as a `.muxapp` package installed through Archive Manager and runs the same SDL menu used on the other Linux targets.
 
+> muOS 2606.0 Andromeda introduced Pickles, a new libretro frontend with native offline achievements support: it caches achievement data for games you have played online and sends unlocks when RetroAchievements is reachable again. Pickles talks to RetroAchievements directly, so RAOfflineProxy is not used with it. RAOfflineProxy still works with RetroArch on muOS.
+
 == ROCKNIX
 
 It is currently compatible with [ROCKNIX 20260701](https://github.com/ROCKNIX/distribution/releases/tag/20260701) or newer.
@@ -51,12 +53,9 @@ Both RetroArch and standalone PPSSPP are supported on ROCKNIX. Starting the prox
 
 == spruce
 
-spruce support is experimental. Tested on a Miyoo Flip.
+RAOfflineProxy is built into [spruceOS v4.5.0](https://github.com/spruceUI/spruceOS/releases/tag/v4.5.0) and later, so there is nothing to install.
 
-spruce starts and stops the proxy with its own network services and picks games to cache
-from its game list, so there is one build for every device — armv7 (Miyoo Mini, Mini Plus,
-Mini Flip, A30) and aarch64 alike — and no on-device menu of ours. It needs a spruce with
-`spruce/scripts/appEnv.sh`.
+spruce runs the proxy itself: it starts and stops it with its own network services, and you pick games to cache from spruce's game list. There is no RAOfflineProxy app or menu on spruce. Cached games are marked in the game list and managed in spruce's **RetroAchievements Settings**.
 
 == Allium
 

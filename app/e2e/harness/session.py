@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
+import tempfile
 import time
+from pathlib import Path
 
 from app.e2e.harness.device import AndroidDevice
 from app.e2e.harness.fake_ra_host import HostFakeRa
@@ -16,7 +19,9 @@ PROXY_NOTIFICATION_ID = 1
 PREFS_FILE = "shared_prefs/ra_proxy_prefs.xml"
 
 CONFIG_URI = "content://%s.config" % APP_PACKAGE
-CLIENT_RECEIVER = "com.raofflineproxy.e2e.client/.ControlReceiver"
+CLIENT_PACKAGE = "com.raofflineproxy.e2e.client"
+CLIENT_RECEIVER = CLIENT_PACKAGE + "/.ControlReceiver"
+CONTROL_PERMISSION = APP_PACKAGE + ".permission.CONTROL_PROXY"
 CONTROL_OUTPUT = re.compile(r'-> result=(\S+) status=(\{.*\})"')
 
 FLYCAST_PACKAGE = "com.flycast.emulator"
@@ -73,6 +78,32 @@ def retroarch_cfg(hardcore: bool, custom_host: str = "") -> str:
     ) % (USER, TOKEN, "true" if hardcore else "false", custom_host)
 
 
+DATABASE_FILE = "databases/raofflineproxy.db"
+LOGIN_KEY_PREFIX = "login2::"
+
+
+def read_cached_login(database_dir: Path) -> dict | None:
+    """The cached login row of an app database copied into database_dir, or None."""
+    database = database_dir / "raofflineproxy.db"
+    if not database.exists():
+        return None
+    try:
+        connection = sqlite3.connect(str(database))
+        try:
+            row = connection.execute(
+                "SELECT cacheKey, responseBody FROM api_cache WHERE cacheKey LIKE ?",
+                (LOGIN_KEY_PREFIX + "%",),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        body = json.loads(row[1])
+    except (sqlite3.Error, ValueError):
+        return None
+    return {"user": body.get("User"), "token": body.get("Token")}
+
+
 def cfg_value(content: str, key: str) -> str | None:
     match = re.search(
         r'^\s*%s\s*=\s*"(.*)"\s*$' % re.escape(key), content or "", re.MULTILINE
@@ -117,12 +148,54 @@ class AndroidSession:
         self.device.allow_all_files_access(APP_PACKAGE)
         if self.device.sdk_int() >= 33:
             self.device.grant(APP_PACKAGE, "android.permission.POST_NOTIFICATIONS")
+        self.device.grant(CLIENT_PACKAGE, CONTROL_PERMISSION)
         self.device.write_app_file(APP_PACKAGE, PREFS_FILE, SEEDED_PREFS)
         self.device.remove(RETROARCH_BACKUP)
         self.seed_cfg(hardcore=hardcore)
 
     def seed_cfg(self, hardcore: bool) -> None:
         self.device.write_file(RETROARCH_CFG, retroarch_cfg(hardcore))
+
+    def disable_emulator(self, pref_key: str) -> None:
+        """Turns one emulator off in the seeded prefs. Call before launch()."""
+        flag = '    <boolean name="%s" value="false" />\n' % pref_key
+        self.device.write_app_file(APP_PACKAGE, PREFS_FILE, SEEDED_PREFS.replace("</map>", flag + "</map>"))
+
+    def cached_login(self) -> dict | None:
+        with tempfile.TemporaryDirectory() as directory:
+            for suffix in ("", "-wal", "-shm"):
+                data = self.device.pull_app_file(APP_PACKAGE, DATABASE_FILE + suffix)
+                if data is not None:
+                    (Path(directory) / ("raofflineproxy.db" + suffix)).write_bytes(data)
+            return read_cached_login(Path(directory))
+
+    def wait_for_dialog_button(self, button: int, text: str, timeout: float = 60.0) -> dict:
+        return self.ui.wait_for("android:id/button%d" % button, text=text, timeout=timeout)
+
+    def tap_dialog_button(self, button: int, text: str) -> None:
+        self.ui.tap(self.wait_for_dialog_button(button, text))
+
+    def tap_start_and_wait_for_login_choice(self) -> None:
+        self.tap_proxy_toggle(START_LABEL)
+        self.wait_for_dialog_button(2, "Start without")
+
+    def wait_for_proxy_started(self) -> None:
+        wait_until(self.proxy_service_running, 60, message="ProxyService running")
+        self.wait_for_proxy_toggle(STOP_LABEL)
+
+    def fill_login_form(self, username: str, password: str) -> None:
+        # In landscape the soft keyboard goes fullscreen over the form, so the second field
+        # cannot be tapped: Tab moves on, and the keyboard is hidden before Save is tapped.
+        self.ui.tap(self.ui.wait_for("et_manual_credentials_username", timeout=60))
+        self.device.input_text(username)
+        self.device.press("KEYCODE_TAB")
+        self.device.input_text(password)
+        self.device.hide_keyboard()
+
+    def background_and_return(self) -> None:
+        self.device.adb.shell("input keyevent KEYCODE_HOME")
+        time.sleep(1.0)
+        self.device.launch(MAIN_ACTIVITY)
 
     def launch(self) -> None:
         self.device.launch(MAIN_ACTIVITY)
@@ -218,10 +291,12 @@ class AndroidSession:
 
     def control(self, method: str) -> tuple:
         """Calls the provider from the automation client, which holds the control permission."""
-        output = self.device.adb.shell(
+        return parse_control_output(self.control_output(method))
+
+    def control_output(self, method: str) -> str:
+        return self.device.adb.shell(
             "am broadcast -n %s --es method %s" % (CLIENT_RECEIVER, method), timeout=120
         ).stdout
-        return parse_control_output(output)
 
     def status(self) -> dict:
         return self.control("status")[1]

@@ -365,6 +365,7 @@ class LinuxRomBrowserTests(unittest.TestCase):
                     cache_store,
                     _config_data,
                     cache_images=True,
+                    source_rom_path=None,
                 ):
                     self.assertEqual(hash_value, "abcd")
                     cache_store.upsert_cache(
@@ -437,6 +438,7 @@ class LinuxRomBrowserTests(unittest.TestCase):
                     cache_store,
                     _config_data,
                     cache_images=True,
+                    source_rom_path=None,
                 ):
                     cache_store.upsert_cache(
                         cache_keys.patch(game_id, credentials["user"]),
@@ -604,6 +606,7 @@ class LinuxRomBrowserTests(unittest.TestCase):
                     cache_store,
                     _config_data,
                     cache_images=True,
+                    source_rom_path=None,
                 ):
                     self.assertEqual(hash_value, "5f397a1e588cfe96b4aa4bab7a5b1d44")
                     cache_store.upsert_cache(
@@ -1152,9 +1155,7 @@ class LinuxRomBrowserTests(unittest.TestCase):
 
                 rom_browser.remove_cached_game(store, 10701)
 
-                remaining_keys = {
-                    entry["cacheKey"] for entry in store.get_all_cache_by_prefix("")
-                }
+                remaining_keys = set(store.cache_keys_by_prefix(""))
                 self.assertNotIn(cache_keys.game_id("abc123"), remaining_keys)
                 self.assertNotIn(cache_keys.patch(10701, "misantronic"), remaining_keys)
                 self.assertNotIn(
@@ -1200,6 +1201,7 @@ class LinuxRomBrowserTests(unittest.TestCase):
                     cache_store,
                     _config_data,
                     cache_images=True,
+                    source_rom_path=None,
                 ):
                     self.assertEqual(hash_value, "primary")
                     cache_store.upsert_cache(
@@ -1258,6 +1260,7 @@ class LinuxRomBrowserTests(unittest.TestCase):
                     cache_store,
                     _config_data,
                     cache_images=True,
+                    source_rom_path=None,
                 ):
                     self.assertEqual(game_id, 10701)
                     self.assertEqual(hash_value, "3e399fdc568d0a0e140a5a277a5c32f3")
@@ -1300,12 +1303,9 @@ class LinuxRomBrowserTests(unittest.TestCase):
 
                 rom_browser.remove_cached_game(store, 10701)
 
-                self.assertEqual(store.get_all_cache_by_prefix("patch:10701:"), [])
-                self.assertEqual(store.get_all_cache_by_prefix("unlocks:10701:"), [])
-                self.assertEqual(
-                    store.get_all_cache_by_prefix("startsession:10701:"),
-                    [],
-                )
+                self.assertEqual(store.cache_keys_by_prefix("patch:10701:"), [])
+                self.assertEqual(store.cache_keys_by_prefix("unlocks:10701:"), [])
+                self.assertEqual(store.cache_keys_by_prefix("startsession:10701:"), [])
             finally:
                 store.close()
 
@@ -1456,6 +1456,58 @@ class LinuxRomBrowserTests(unittest.TestCase):
                 "Metroid ##GAMEID:204",
             ],
         )
+
+    def test_main_cached_games_json_includes_the_rom_path(self) -> None:
+        stdout = StringIO()
+        with mock.patch("sys.argv", ["raofflineproxy", "cached-games", "--json"]), \
+                mock.patch.object(main, "load_config", return_value={}), \
+                mock.patch.object(
+                    main,
+                    "list_cached_games",
+                    return_value=[
+                        rom_browser.CachedGameEntry(game_id=10701, title="Tetris"),
+                        rom_browser.CachedGameEntry(game_id=204, title="Metroid"),
+                    ],
+                ), \
+                mock.patch.object(main, "cached_unlock_counts", return_value={10701: 3}), \
+                mock.patch.object(main, "cached_rom_paths_by_game", return_value={10701: "/GB/Tetris.gb"}), \
+                mock.patch("sys.stdout", stdout):
+            main.main()
+
+        self.assertEqual(
+            [
+                {"game_id": 10701, "title": "Tetris", "unlocks": 3, "rom_path": "/GB/Tetris.gb"},
+                {"game_id": 204, "title": "Metroid", "unlocks": None, "rom_path": None},
+            ],
+            json.loads(stdout.getvalue()),
+        )
+
+    def test_cached_rom_paths_by_game(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = storage.Storage(database_path=Path(temp_dir) / "test.sqlite3")
+            try:
+                store.upsert_cache(
+                    cache_keys.patch(10701, "misantronic"), "{}", cached_at=1,
+                    source_rom_path="/mnt/SDCARD/Roms/GB/Tetris.gb",
+                )
+                store.upsert_cache(cache_keys.patch(204, "misantronic"), "{}", cached_at=1)
+                store.upsert_cache(
+                    cache_keys.patch(355, "misantronic"), "{}", cached_at=1,
+                    source_rom_path="/SFC/Zelda (Europe).sfc",
+                )
+                store.upsert_cache(
+                    cache_keys.patch(355, "other"), "{}", cached_at=2,
+                    source_rom_path="/SFC/Zelda (USA).sfc",
+                )
+                store.upsert_cache(
+                    cache_keys.game_id("abc"), "{}", cached_at=1, source_rom_path="/GB/Other.gb"
+                )
+
+                paths = rom_browser.cached_rom_paths_by_game(store)
+            finally:
+                store.close()
+
+        self.assertEqual({10701: "/GB/Tetris.gb", 355: "/SFC/Zelda (USA).sfc"}, paths)
 
     def test_main_remove_cached_game_prints_result_message(self) -> None:
         stdout = StringIO()
